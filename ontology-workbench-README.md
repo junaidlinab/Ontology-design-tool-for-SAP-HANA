@@ -46,5 +46,5 @@ This is a working prototype and reference implementation, shared to show the app
 
 ## Author
 
-Junaid Ahmed, SAP + AI Architect
-LinkedIn: (add your LinkedIn URL) · GitHub: github.com/junaidlinab
+Junaid Ahmed, 
+Contact: junaid.linab@gmail.com
