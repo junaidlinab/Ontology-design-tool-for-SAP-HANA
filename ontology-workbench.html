@@ -1,0 +1,1623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ontology workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<style>body{margin:0;background:#EDF0F3} #boot{font-family:system-ui,sans-serif;color:#5B6B79;padding:40px;text-align:center}</style>
+</head>
+<body>
+<div id="root"><div id="boot">Loading the workbench… This needs an internet connection the first time the page loads.</div></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useEffect } = React;
+let API_KEY = "";
+let MODEL = "claude-sonnet-5";
+
+// ---------------------------------------------------------------------------
+// Core logic (no UI)
+// ---------------------------------------------------------------------------
+const RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const RDFS = "http://www.w3.org/2000/01/rdf-schema#";
+const XSD = "http://www.w3.org/2001/XMLSchema#";
+const OWL = "http://www.w3.org/2002/07/owl#";
+const SH = "http://www.w3.org/ns/shacl#";
+const DEFAULT_BASE = "https://example.org/sap-kg/ontology#";
+const DATA_BASE = "https://example.org/sap-kg/data/";
+
+const el = (label, extra) => Object.assign({ "@EndUserText.label": label }, extra);
+const str = (label, key) => el(label, Object.assign({ type: "cds.String" }, key ? { key: true } : {}));
+const to = (target, many, comp) => ({ type: comp ? "cds.Composition" : "cds.Association", target, cardinality: { max: many ? "*" : 1 } });
+
+const SAMPLE_CSN = {
+  definitions: {
+    "demo.sales.BusinessPartner": el("Business partner", { kind: "entity", elements: {
+      BusinessPartner: str("Business partner number", true),
+      FullName: str("Full name"),
+      Country: str("Country"),
+      IsBlocked: el("Blocked for business", { type: "cds.Boolean" }),
+      _Role: to("demo.sales.BusinessPartnerRole", true, true),
+    } }),
+    "demo.sales.BusinessPartnerRole": el("Business partner role", { kind: "entity", elements: {
+      BusinessPartner: str("Business partner number", true),
+      Role: str("Role code", true),
+      ValidFrom: el("Valid from", { type: "cds.Date" }),
+      _BusinessPartner: to("demo.sales.BusinessPartner", false),
+    } }),
+    "demo.sales.SalesOrder": el("Sales order", { kind: "entity", elements: {
+      SalesOrder: str("Sales order number", true),
+      SalesOrderDate: el("Order date", { type: "cds.Date" }),
+      TotalNetAmount: el("Net value", { type: "cds.Decimal" }),
+      OverallStatus: str("Overall status"),
+      _SoldToParty: to("demo.sales.BusinessPartner", false),
+      _Item: to("demo.sales.SalesOrderItem", true, true),
+    } }),
+    "demo.sales.SalesOrderItem": el("Sales order item", { kind: "entity", elements: {
+      SalesOrder: str("Sales order number", true),
+      SalesOrderItem: str("Item number", true),
+      Quantity: el("Order quantity", { type: "cds.Decimal" }),
+      NetAmount: el("Net value", { type: "cds.Decimal" }),
+      _SalesOrder: to("demo.sales.SalesOrder", false),
+      _Product: to("demo.sales.Product", false),
+      _Plant: to("demo.sales.Plant", false),
+    } }),
+    "demo.sales.Product": el("Product", { kind: "entity", elements: {
+      Product: str("Product number", true),
+      ProductDescription: str("Description"),
+      ProductGroup: str("Product group"),
+      BaseUnit: str("Base unit"),
+    } }),
+    "demo.sales.PurchasingInfoRecord": el("Purchasing info record", { kind: "entity", elements: {
+      PurchasingInfoRecord: str("Info record number", true),
+      NetPrice: el("Net price", { type: "cds.Decimal" }),
+      _Supplier: to("demo.sales.BusinessPartner", false),
+      _Product: to("demo.sales.Product", false),
+    } }),
+    "demo.sales.Plant": el("Plant", { kind: "entity", elements: {
+      Plant: str("Plant code", true),
+      PlantName: str("Plant name"),
+      City: str("City"),
+    } }),
+    "demo.sales.MaintenanceOrder": el("Maintenance order", { kind: "entity", elements: {
+      MaintenanceOrder: str("Order number", true),
+      OrderType: str("Order type"),
+      Priority: str("Priority"),
+      _Plant: to("demo.sales.Plant", false),
+    } }),
+  },
+};
+
+// ---------- naming helpers
+const humanize = (s) => {
+  const w = String(s).replace(/^_+/, "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_\-.]+/g, " ").trim().toLowerCase();
+  return w.charAt(0).toUpperCase() + w.slice(1);
+};
+const pascal = (s) => String(s).replace(/^_+/, "").split(/[^A-Za-z0-9]+/).filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("");
+const lcFirst = (s) => s.charAt(0).toLowerCase() + s.slice(1);
+const camel = (s) => lcFirst(pascal(s));
+const localName = (s) => String(s || "").split(".").pop();
+
+function xsdFor(t) {
+  t = String(t || "").toLowerCase();
+  if (/bool/.test(t)) return "xsd:boolean";
+  if (/datetime|timestamp/.test(t)) return "xsd:dateTime";
+  if (/date/.test(t)) return "xsd:date";
+  if (/timeofday|\.time$/.test(t)) return "xsd:time";
+  if (/int|byte/.test(t)) return "xsd:integer";
+  if (/decimal|double|float|single/.test(t)) return "xsd:decimal";
+  return "xsd:string";
+}
+
+// ---------- metadata parsers
+function parseCSN(json) {
+  const defs = json.definitions || {};
+  const out = [];
+  for (const [full, d] of Object.entries(defs)) {
+    if (!d || d.kind !== "entity") continue;
+    const attrs = [], assocs = [], keys = [];
+    for (const [name, e] of Object.entries(d.elements || {})) {
+      const t = e.type || "";
+      if (t === "cds.Association" || t === "cds.Composition" || e.target) {
+        const max = e.cardinality && e.cardinality.max;
+        assocs.push({ name, target: localName(e.target), many: max === "*" || (typeof max === "number" && max > 1), composition: t === "cds.Composition", label: e["@EndUserText.label"] || "" });
+      } else {
+        attrs.push({ name, type: t || "cds.String", key: !!e.key, label: e["@EndUserText.label"] || e["@title"] || e["@Common.Label"] || "" });
+        if (e.key) keys.push(name);
+      }
+    }
+    out.push({ name: localName(full), full, label: d["@EndUserText.label"] || d["@title"] || d["@Common.Label"] || "", attrs, assocs, keys, annotations: Object.keys(d).filter((k) => k.startsWith("@")) });
+  }
+  return out;
+}
+
+function parseEDMX(text) {
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length) throw new Error("The file is not valid XML.");
+  const tags = (node, tag) => Array.from(node.getElementsByTagNameNS("*", tag));
+  const assocMap = {};
+  tags(doc, "Association").forEach((a) => {
+    assocMap[a.getAttribute("Name")] = tags(a, "End").map((e) => ({ role: e.getAttribute("Role"), type: localName(e.getAttribute("Type")), mult: e.getAttribute("Multiplicity") }));
+  });
+  return tags(doc, "EntityType").map((et) => {
+    const name = et.getAttribute("Name");
+    const keys = tags(et, "PropertyRef").map((p) => p.getAttribute("Name"));
+    const attrs = tags(et, "Property").map((p) => ({ name: p.getAttribute("Name"), type: p.getAttribute("Type") || "Edm.String", key: keys.includes(p.getAttribute("Name")), label: p.getAttribute("sap:label") || "" }));
+    const assocs = tags(et, "NavigationProperty").map((n) => {
+      const t = n.getAttribute("Type");
+      let target = "", many = false;
+      if (t) { many = t.startsWith("Collection("); target = localName(t.replace(/^Collection\(|\)$/g, "")); }
+      else {
+        const rel = localName(n.getAttribute("Relationship"));
+        const end = (assocMap[rel] || []).find((e) => e.role === n.getAttribute("ToRole"));
+        if (end) { target = end.type; many = end.mult === "*"; }
+      }
+      return { name: n.getAttribute("Name"), target, many, composition: false, label: "" };
+    });
+    return { name, full: name, label: et.getAttribute("sap:label") || "", attrs, assocs, keys, annotations: [] };
+  });
+}
+
+// ---------- ontology model helpers
+const accepted = (o) => ({ classes: o.classes.filter((x) => x.accepted), oprops: o.oprops.filter((x) => x.accepted), dprops: o.dprops.filter((x) => x.accepted) });
+
+function buildBaseline(entities, scope) {
+  const inScope = entities.filter((e) => scope.includes(e.full));
+  const byName = {};
+  inScope.forEach((e) => (byName[e.name] = e));
+  const used = new Set();
+  const skipped = [];
+  const classes = inScope.map((e) => {
+    const id = pascal(e.name);
+    used.add(id);
+    return { id, label: e.label || humanize(e.name), comment: "", superClass: "", source: e.full, origin: "metadata", accepted: true };
+  });
+  const unique = (base, cls) => {
+    let id = used.has(base) ? camel(cls) + pascal(base) : base;
+    let k = 2;
+    const stem = id;
+    while (used.has(id)) id = stem + k++;
+    used.add(id);
+    return id;
+  };
+  const oprops = [], dprops = [];
+  inScope.forEach((e) => e.assocs.forEach((a) => {
+    if (!byName[a.target]) { skipped.push(`${e.name}.${a.name} points to ${a.target || "an unknown entity"}, which is outside the scope.`); return; }
+    oprops.push({ id: unique(camel(a.name), e.name), label: humanize(a.name), domain: pascal(e.name), range: pascal(a.target), maxOne: !a.many, inverseOf: "", chain: null, source: `${e.full}.${a.name}`, origin: "metadata", accepted: true });
+  }));
+  inScope.forEach((e) => e.attrs.forEach((at) => {
+    if (e.assocs.some((a) => a.target === at.name && byName[a.target])) { skipped.push(`${e.name}.${at.name} is a foreign key already covered by a relationship. It stays in the metadata for identity only.`); return; }
+    const base = byName[at.name] || at.name === e.name ? camel(at.name) + "Id" : camel(at.name);
+    dprops.push({ id: unique(base, e.name), label: at.label || humanize(at.name), domain: pascal(e.name), range: xsdFor(at.type), key: at.key, source: `${e.full}.${at.name}`, origin: "metadata", accepted: true });
+  }));
+  // pair up inverse associations (to-one on one side, to-many on the other)
+  oprops.forEach((p) => {
+    if (p.inverseOf || p.domain === p.range) return;
+    const q = oprops.find((x) => x !== p && !x.inverseOf && x.domain === p.range && x.range === p.domain && x.maxOne !== p.maxOne);
+    if (q) { p.inverseOf = q.id; q.inverseOf = p.id; }
+  });
+  return { onto: { classes, oprops, dprops }, skipped };
+}
+
+function renameTerm(onto, cqs, oldId, newId) {
+  const fix = (v) => (v === oldId ? newId : v);
+  const o = {
+    classes: onto.classes.map((c) => ({ ...c, id: fix(c.id), superClass: fix(c.superClass) })),
+    oprops: onto.oprops.map((p) => ({ ...p, id: fix(p.id), domain: fix(p.domain), range: fix(p.range), inverseOf: fix(p.inverseOf), chain: p.chain ? p.chain.map(fix) : null })),
+    dprops: onto.dprops.map((p) => ({ ...p, id: fix(p.id), domain: fix(p.domain) })),
+  };
+  const re = new RegExp(`onto:${oldId}(?![A-Za-z0-9_])`, "g");
+  const q = cqs.map((c) => (c.sparql ? { ...c, sparql: c.sparql.replace(re, `onto:${newId}`) } : c));
+  return { onto: o, cqs: q };
+}
+
+// ---------- modelling checks (from Noy & McGuinness, plus SAP-specific ones)
+function lint(onto, cqs) {
+  const a = accepted(onto);
+  const out = [];
+  const classIds = new Set(a.classes.map((c) => c.id));
+  const count = {};
+  [...a.classes, ...a.oprops, ...a.dprops].forEach((x) => (count[x.id] = (count[x.id] || 0) + 1));
+  Object.entries(count).filter(([, n]) => n > 1).forEach(([id]) => out.push({ sev: "error", term: id, msg: "This name is used more than once. Every class and property needs a unique name." }));
+  a.classes.forEach((c) => { if (c.superClass && !classIds.has(c.superClass)) out.push({ sev: "error", term: c.id, msg: `Its parent class ${c.superClass} doesn't exist or was rejected.` }); });
+  const kids = {};
+  a.classes.forEach((c) => { if (c.superClass) (kids[c.superClass] = kids[c.superClass] || []).push(c.id); });
+  Object.entries(kids).forEach(([p, ks]) => {
+    if (ks.length === 1) out.push({ sev: "warn", term: p, msg: `${p} has only one subclass (${ks[0]}). A single child usually means the extra level adds nothing, or its siblings are missing.` });
+    if (ks.length > 12) out.push({ sev: "warn", term: p, msg: `${p} has ${ks.length} direct subclasses. Intermediate groupings may make it easier to use.` });
+  });
+  const looped = new Set();
+  a.classes.forEach((c) => {
+    const seen = new Set([c.id]);
+    let cur = c.superClass;
+    while (cur) {
+      if (seen.has(cur)) { if (!looped.has(cur)) out.push({ sev: "error", term: c.id, msg: "The class hierarchy loops back on itself here." }); looped.add(cur); break; }
+      seen.add(cur);
+      const nx = a.classes.find((x) => x.id === cur);
+      cur = nx ? nx.superClass : "";
+    }
+  });
+  a.classes.forEach((c) => {
+    if (/(Blocked|Active|Inactive|Open|Closed|Pending|Cancel+ed|Approved|Released|Overdue|Current)/.test(c.id))
+      out.push({ sev: "warn", term: c.id, msg: "This looks like a state that things move in and out of. It probably belongs as a property value, not a class." });
+    if (/[^su]s$/.test(c.id) && !/is$/.test(c.id)) out.push({ sev: "info", term: c.id, msg: "Class names are usually singular. Pick one convention and keep it." });
+  });
+  const groups = [["customer", "businesspartner", "account", "client", "soldtoparty", "buyer"], ["supplier", "vendor"], ["product", "material", "article", "sku"], ["employee", "worker", "person"], ["plant", "site", "facility"]];
+  const norm = (s) => s.toLowerCase().replace(/[^a-z]/g, "");
+  for (let i = 0; i < a.classes.length; i++) for (let j = i + 1; j < a.classes.length; j++) {
+    const x = norm(a.classes[i].id), y = norm(a.classes[j].id);
+    if (x === y || groups.some((g) => g.includes(x) && g.includes(y)))
+      out.push({ sev: "warn", term: a.classes[i].id, msg: `${a.classes[i].id} and ${a.classes[j].id} may be one concept under two names. Synonyms should be a single class.` });
+  }
+  a.oprops.forEach((p) => {
+    if (!classIds.has(p.domain)) out.push({ sev: "error", term: p.id, msg: `Its domain ${p.domain || "(empty)"} isn't an accepted class.` });
+    if (!classIds.has(p.range)) out.push({ sev: "error", term: p.id, msg: `Its range ${p.range || "(empty)"} isn't an accepted class.` });
+    if (p.inverseOf && !a.oprops.find((o) => o.id === p.inverseOf)) out.push({ sev: "warn", term: p.id, msg: `Its inverse ${p.inverseOf} doesn't exist or was rejected.` });
+    if (p.chain) p.chain.forEach((s) => { if (!a.oprops.find((o) => o.id === s)) out.push({ sev: "error", term: p.id, msg: `Chain step ${s} doesn't exist or was rejected.` }); });
+  });
+  a.dprops.forEach((p) => { if (!classIds.has(p.domain)) out.push({ sev: "error", term: p.id, msg: `Its domain ${p.domain || "(empty)"} isn't an accepted class.` }); });
+  const mapped = cqs.filter((q) => q.sparql);
+  if (mapped.length) {
+    const text = mapped.map((q) => q.sparql).join("\n");
+    const unused = [...a.classes, ...a.oprops].filter((x) => !new RegExp(`onto:${x.id}(?![A-Za-z0-9_])`).test(text)).map((x) => x.id);
+    if (unused.length) out.push({ sev: "info", term: `${unused.length} terms`, msg: `No question uses ${unused.slice(0, 6).join(", ")}${unused.length > 6 ? " and others" : ""}. The ontology only needs what the questions need; keep these only if a known future question requires them.` });
+  }
+  return out;
+}
+
+// ---------- synthetic sample data
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const I = (v) => ({ k: "i", v });
+const Lit = (v, dt) => ({ k: "l", v: String(v), dt: dt || XSD + "string" });
+
+function sampleValue(p, i, rnd) {
+  const id = p.id.toLowerCase();
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const pad = (n) => String(n).padStart(2, "0");
+  switch (p.range) {
+    case "xsd:boolean": return Lit(String(rnd() < 0.3), XSD + "boolean");
+    case "xsd:integer": return Lit(1 + Math.floor(rnd() * 99), XSD + "integer");
+    case "xsd:decimal": return Lit((rnd() * 5000 + 10).toFixed(2), XSD + "decimal");
+    case "xsd:date": return Lit(`2026-${pad(1 + Math.floor(rnd() * 9))}-${pad(1 + Math.floor(rnd() * 28))}`, XSD + "date");
+    case "xsd:dateTime": return Lit(`2026-${pad(1 + Math.floor(rnd() * 9))}-${pad(1 + Math.floor(rnd() * 28))}T10:00:00Z`, XSD + "dateTime");
+    case "xsd:time": return Lit("10:30:00", XSD + "time");
+    default: break;
+  }
+  if (/country/.test(id)) return Lit(pick(["DE", "US", "IN", "FR", "JP"]));
+  if (/city/.test(id)) return Lit(pick(["Walldorf", "Chennai", "Austin", "Lyon", "Osaka"]));
+  if (/status/.test(id)) return Lit(pick(["Open", "In process", "Completed"]));
+  if (/priority/.test(id)) return Lit(pick(["High", "Medium", "Low"]));
+  if (/role/.test(id)) return Lit(pick(["Customer", "Supplier"]));
+  if (/type|group|category|unit/.test(id)) return Lit(pick(["A", "B", "C"]) + (10 + Math.floor(rnd() * 3)));
+  if (p.key || /(id|number)$/.test(id)) return Lit(String(100000 + i * 7 + Math.floor(rnd() * 5)));
+  if (/name/.test(id)) return Lit(pick(["Acme Components", "Nordlicht GmbH", "Kaveri Traders", "Blue Ridge Supply", "Helvetia Tools", "Sakura Parts"]));
+  return Lit(`${p.label} ${i + 1}`);
+}
+
+function synthesize(onto, base, dataBase, n) {
+  const a = accepted(onto);
+  const rnd = mulberry32(20260923);
+  const triples = [];
+  const seen = new Set();
+  const add = (s, p, o) => {
+    const key = s.v + "|" + p.v + "|" + o.k + o.v;
+    if (seen.has(key)) return;
+    seen.add(key);
+    triples.push([s, p, o]);
+  };
+  const byId = {};
+  a.classes.forEach((c) => (byId[c.id] = c));
+  const anc = (id) => {
+    const out = [], s = new Set();
+    let cur = id;
+    while (cur && byId[cur] && !s.has(cur)) { s.add(cur); out.push(cur); cur = byId[cur].superClass; }
+    return out;
+  };
+  const hasKids = new Set(a.classes.filter((c) => c.superClass).map((c) => c.superClass));
+  const concrete = a.classes.filter((c) => !(c.origin !== "metadata" && hasKids.has(c.id)));
+  const typeIdx = {};
+  concrete.forEach((c) => {
+    for (let i = 1; i <= n; i++) {
+      const s = I(dataBase + c.id + "_" + i);
+      anc(c.id).forEach((t) => { add(s, I(RDF + "type"), I(base + t)); (typeIdx[t] = typeIdx[t] || []).push(s.v); });
+      add(s, I(RDFS + "label"), Lit(`${c.label} ${i}`));
+    }
+  });
+  a.dprops.forEach((p) => (typeIdx[p.domain] || []).forEach((s, i) => add(I(s), I(base + p.id), sampleValue(p, i, rnd))));
+  const plain = a.oprops.filter((p) => !p.chain).sort((x, y) => Number(y.maxOne) - Number(x.maxOne));
+  const done = new Set();
+  plain.forEach((p) => {
+    if (done.has(p.id)) return;
+    done.add(p.id);
+    const inv = p.inverseOf ? plain.find((o) => o.id === p.inverseOf) : null;
+    if (inv) done.add(inv.id);
+    const targets = typeIdx[p.range] || [];
+    (typeIdx[p.domain] || []).forEach((s) => {
+      const pool = targets.filter((t) => t !== s);
+      if (!pool.length) return;
+      const k = p.maxOne ? 1 : 1 + Math.floor(rnd() * Math.min(3, pool.length));
+      const chosen = new Set();
+      while (chosen.size < k) chosen.add(pool[Math.floor(rnd() * pool.length)]);
+      chosen.forEach((t) => {
+        add(I(s), I(base + p.id), I(t));
+        if (inv) add(I(t), I(base + inv.id), I(s));
+      });
+    });
+  });
+  // materialize property chains (simulates the reasoning a store would do)
+  a.oprops.filter((p) => p.chain && p.chain.length).forEach((p) => {
+    let pairs = triples.filter((t) => t[1].v === base + p.chain[0]).map((t) => [t[0].v, t[2].v]);
+    for (let i = 1; i < p.chain.length; i++) {
+      const step = triples.filter((t) => t[1].v === base + p.chain[i]);
+      const next = [];
+      pairs.forEach(([s, m]) => step.forEach((t) => { if (t[0].v === m) next.push([s, t[2].v]); }));
+      pairs = next;
+    }
+    pairs.forEach(([s, o]) => add(I(s), I(base + p.id), I(o)));
+  });
+  return triples;
+}
+
+// ---------- a small SPARQL engine for design-time tests
+const FUNCS = ["STR", "LCASE", "UCASE", "CONTAINS", "STRSTARTS", "STRENDS", "REGEX", "BOUND", "ISIRI", "ISLITERAL"];
+
+function tokenize(q) {
+  const re = /\s+|#[^\n]*|<[^<>\s]*>|"(?:[^"\\]|\\.)*"(?:\^\^[^\s;,{}()]+|@[a-zA-Z-]+)?|'(?:[^'\\]|\\.)*'|[?$][A-Za-z_]\w*|[-+]?\d+(?:\.\d+)?(?![\w:])|!=|<=|>=|&&|\|\||[{}().;,*=<>!]|[A-Za-z_][\w-]*:[\w.-]*|:[\w.-]*|[A-Za-z_][\w-]*/y;
+  const toks = [];
+  let i = 0;
+  while (i < q.length) {
+    re.lastIndex = i;
+    const m = re.exec(q);
+    if (!m) throw new Error(`Unexpected text near "${q.slice(i, i + 20)}".`);
+    i = re.lastIndex;
+    const t = m[0];
+    if (/^\s/.test(t) || t[0] === "#") continue;
+    if (/^[A-Za-z_]*:[\w.-]*\.$/.test(t)) { toks.push(t.slice(0, -1)); toks.push("."); continue; }
+    toks.push(t);
+  }
+  return toks;
+}
+
+function parseSparql(q, basePrefixes) {
+  const t = tokenize(q);
+  let p = 0;
+  const prefixes = { ...basePrefixes };
+  const peek = () => t[p];
+  const next = () => t[p++];
+  const up = (x) => String(x || "").toUpperCase();
+  const expand = (pn) => {
+    const i = pn.indexOf(":");
+    const pre = pn.slice(0, i);
+    if (!(pre in prefixes)) throw new Error(`Unknown prefix "${pre}:". Declare it with PREFIX.`);
+    return prefixes[pre] + pn.slice(i + 1);
+  };
+  const term = (tok) => {
+    if (tok === undefined) throw new Error("The query ended unexpectedly.");
+    if (tok[0] === "?" || tok[0] === "$") return { type: "var", name: tok.slice(1) };
+    if (tok[0] === "<") return { type: "iri", value: tok.slice(1, -1) };
+    if (tok[0] === '"' || tok[0] === "'") {
+      const m = tok.match(/^(["'])([\s\S]*)\1(?:\^\^(.+)|@(.+))?$/);
+      const dt = m[3] ? (m[3][0] === "<" ? m[3].slice(1, -1) : expand(m[3])) : null;
+      return { type: "lit", value: m[2].replace(/\\(.)/g, "$1"), datatype: dt };
+    }
+    if (/^[-+]?\d/.test(tok)) return { type: "lit", value: tok, datatype: XSD + (tok.includes(".") ? "decimal" : "integer") };
+    if (tok === "true" || tok === "false") return { type: "lit", value: tok, datatype: XSD + "boolean" };
+    if (tok.includes(":")) return { type: "iri", value: expand(tok) };
+    throw new Error(`Unexpected "${tok}" in a triple pattern.`);
+  };
+  while (up(peek()) === "PREFIX") {
+    next();
+    const pn = next(), iri = next();
+    if (!pn || !pn.endsWith(":") || !iri || iri[0] !== "<") throw new Error("A PREFIX line is malformed.");
+    prefixes[pn.slice(0, -1)] = iri.slice(1, -1);
+  }
+  if (up(next()) !== "SELECT") throw new Error("Only SELECT queries can be tested here.");
+  let distinct = false;
+  if (up(peek()) === "DISTINCT") { distinct = true; next(); }
+  const vars = [];
+  while (peek() !== undefined && up(peek()) !== "WHERE" && peek() !== "{") {
+    const v = next();
+    if (v === "*") vars.push("*");
+    else if (v[0] === "?" || v[0] === "$") vars.push(v.slice(1));
+    else throw new Error(`"${v}" in SELECT isn't supported. The test engine returns plain variables, not aggregates or expressions.`);
+  }
+  if (up(peek()) === "WHERE") next();
+  if (next() !== "{") throw new Error('Expected "{" to open the WHERE block.');
+
+  const parsePrim = () => {
+    const tok = peek();
+    if (tok === "(") { next(); const e = parseOr(); if (next() !== ")") throw new Error('A FILTER is missing ")".'); return e; }
+    if (FUNCS.includes(up(tok)) && t[p + 1] === "(") {
+      next(); next();
+      const args = [];
+      if (peek() !== ")") { args.push(parseOr()); while (peek() === ",") { next(); args.push(parseOr()); } }
+      if (next() !== ")") throw new Error(`${up(tok)}( is missing ")".`);
+      return { op: "fn", name: up(tok), args };
+    }
+    if (tok !== undefined && /^[A-Za-z]+$/.test(tok) && t[p + 1] === "(") throw new Error(`The function ${up(tok)} isn't supported by the test engine.`);
+    return { op: "term", t: term(next()) };
+  };
+  const parseCmp = () => {
+    const l = parsePrim();
+    if (["=", "!=", "<", ">", "<=", ">="].includes(peek())) { const op = next(); return { op, a: l, b: parsePrim() }; }
+    return l;
+  };
+  const parseUnary = () => (peek() === "!" ? (next(), { op: "!", a: parseUnary() }) : parseCmp());
+  const parseAnd = () => { let l = parseUnary(); while (peek() === "&&") { next(); l = { op: "&&", a: l, b: parseUnary() }; } return l; };
+  const parseOr = () => { let l = parseAnd(); while (peek() === "||") { next(); l = { op: "||", a: l, b: parseAnd() }; } return l; };
+
+  const patterns = [], filters = [];
+  while (peek() !== "}") {
+    if (peek() === undefined) throw new Error('The WHERE block is missing its closing "}".');
+    const kw = up(peek());
+    if (kw === "FILTER") {
+      next();
+      if (peek() !== "(") throw new Error('FILTER must be followed by "(".');
+      filters.push(parsePrim());
+      continue;
+    }
+    if (["OPTIONAL", "UNION", "MINUS", "BIND", "VALUES", "GRAPH", "SERVICE", "{"].includes(kw)) throw new Error(`${kw} isn't supported by the test engine. Rewrite the query with plain triple patterns and FILTER.`);
+    if (peek() === ".") { next(); continue; }
+    const s = term(next());
+    for (;;) {
+      const pt = next();
+      const pr = pt === "a" ? { type: "iri", value: RDF + "type" } : term(pt);
+      for (;;) {
+        patterns.push([s, pr, term(next())]);
+        if (peek() === ",") { next(); continue; }
+        break;
+      }
+      if (peek() === ";") { next(); if (peek() === "." || peek() === "}") break; continue; }
+      break;
+    }
+    if (peek() === ".") next();
+  }
+  next();
+  let limit = null;
+  while (p < t.length) {
+    const k = up(next());
+    if (k === "LIMIT") limit = parseInt(next(), 10);
+    else if (k === "ORDER") { while (p < t.length && up(peek()) !== "LIMIT") next(); }
+    else if (k === "GROUP" || k === "HAVING") throw new Error(`${k} BY isn't supported by the test engine.`);
+  }
+  return { vars, distinct, patterns, filters, limit };
+}
+
+const numLike = (s) => /^[-+]?\d+(\.\d+)?$/.test(s);
+const nodeEq = (a, b) => {
+  if (a.k !== b.k) return false;
+  if (a.v === b.v) return true;
+  return a.k === "l" && numLike(a.v) && numLike(b.v) && parseFloat(a.v) === parseFloat(b.v);
+};
+const toNode = (t) => (t.type === "iri" ? I(t.value) : Lit(t.value, t.datatype || XSD + "string"));
+const sval = (x) => (typeof x === "boolean" ? String(x) : x.v);
+const truthy = (x) => (typeof x === "boolean" ? x : x.k === "l" ? x.v !== "" && x.v !== "false" && x.v !== "0" : true);
+
+function evalExpr(e, b) {
+  switch (e.op) {
+    case "term": {
+      if (e.t.type === "var") { const v = b[e.t.name]; if (!v) throw new Error("unbound"); return v; }
+      return toNode(e.t);
+    }
+    case "!": return !truthy(evalExpr(e.a, b));
+    case "&&": return truthy(evalExpr(e.a, b)) && truthy(evalExpr(e.b, b));
+    case "||": {
+      let l = false, r = false;
+      try { l = truthy(evalExpr(e.a, b)); } catch (x) { l = false; }
+      try { r = truthy(evalExpr(e.b, b)); } catch (x) { r = false; }
+      return l || r;
+    }
+    case "fn": {
+      if (e.name === "BOUND") return !!(e.args[0] && e.args[0].t && b[e.args[0].t.name]);
+      const v = e.args.map((x) => evalExpr(x, b));
+      const s = (i) => sval(v[i]);
+      switch (e.name) {
+        case "STR": return Lit(s(0));
+        case "LCASE": return Lit(s(0).toLowerCase());
+        case "UCASE": return Lit(s(0).toUpperCase());
+        case "CONTAINS": return s(0).includes(s(1));
+        case "STRSTARTS": return s(0).startsWith(s(1));
+        case "STRENDS": return s(0).endsWith(s(1));
+        case "REGEX": return new RegExp(s(1), v[2] ? s(2) : "").test(s(0));
+        case "ISIRI": return typeof v[0] !== "boolean" && v[0].k === "i";
+        case "ISLITERAL": return typeof v[0] !== "boolean" && v[0].k === "l";
+        default: throw new Error("unsupported");
+      }
+    }
+    default: {
+      const l = evalExpr(e.a, b), r = evalExpr(e.b, b);
+      const ls = sval(l), rs = sval(r);
+      const num = numLike(ls) && numLike(rs);
+      const x = num ? parseFloat(ls) : ls, y = num ? parseFloat(rs) : rs;
+      switch (e.op) {
+        case "=": return typeof l !== "boolean" && typeof r !== "boolean" ? nodeEq(l, r) || (l.k === "l" && r.k === "l" && ls === rs) : ls === rs;
+        case "!=": return !(typeof l !== "boolean" && typeof r !== "boolean" ? nodeEq(l, r) : ls === rs);
+        case "<": return x < y;
+        case ">": return x > y;
+        case "<=": return x <= y;
+        case ">=": return x >= y;
+        default: throw new Error("unsupported");
+      }
+    }
+  }
+}
+
+function runQuery(q, triples, base, knownIds) {
+  const parsed = parseSparql(q, { onto: base, ex: DATA_BASE, rdf: RDF, rdfs: RDFS, xsd: XSD, owl: OWL });
+  const unknown = new Set();
+  const checkTerm = (t) => { if (t.type === "iri" && t.value.startsWith(base) && !knownIds.has(t.value.slice(base.length))) unknown.add(t.value.slice(base.length)); };
+  parsed.patterns.forEach((tr) => tr.forEach(checkTerm));
+  const byPred = {};
+  triples.forEach((tr) => (byPred[tr[1].v] = byPred[tr[1].v] || []).push(tr));
+  const match = (t, node, b) => {
+    if (t.type === "var") {
+      const cur = b[t.name];
+      if (cur) return nodeEq(cur, node) ? b : null;
+      return { ...b, [t.name]: node };
+    }
+    return nodeEq(toNode(t), node) ? b : null;
+  };
+  let sols = [{}];
+  for (const [s, pr, o] of parsed.patterns) {
+    const cands = pr.type === "iri" ? byPred[pr.value] || [] : triples;
+    const out = [];
+    for (const b of sols) for (const tr of cands) {
+      let nb = match(s, tr[0], b);
+      if (!nb) continue;
+      nb = match(pr, tr[1], nb);
+      if (!nb) continue;
+      nb = match(o, tr[2], nb);
+      if (nb) out.push(nb);
+    }
+    sols = out;
+    if (sols.length > 20000) throw new Error("The query produces too many intermediate results for the test engine. Add more constraints.");
+  }
+  sols = sols.filter((b) => parsed.filters.every((f) => { try { return truthy(evalExpr(f, b)); } catch (x) { return false; } }));
+  let vars = parsed.vars;
+  if (!vars.length || vars.includes("*")) {
+    const all = [];
+    parsed.patterns.forEach((tr) => tr.forEach((t) => { if (t.type === "var" && !all.includes(t.name)) all.push(t.name); }));
+    vars = all;
+  }
+  let rows = sols.map((b) => vars.map((v) => b[v] || null));
+  if (parsed.distinct) {
+    const s = new Set();
+    rows = rows.filter((r) => { const k = JSON.stringify(r); if (s.has(k)) return false; s.add(k); return true; });
+  }
+  if (parsed.limit != null) rows = rows.slice(0, parsed.limit);
+  return { vars, rows, unknown: [...unknown] };
+}
+
+// ---------- export writers
+const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+const prefixBlock = (base, extra) => [`@prefix onto: <${base}> .`, `@prefix rdf: <${RDF}> .`, `@prefix rdfs: <${RDFS}> .`, `@prefix owl: <${OWL}> .`, `@prefix xsd: <${XSD}> .`, ...(extra || []), ""];
+
+function ontologyTTL(onto, base, title) {
+  const a = accepted(onto);
+  const L = prefixBlock(base);
+  L.push(`<${base.replace(/[#/]$/, "")}> a owl:Ontology ;`, `  rdfs:label "${esc(title)}" ;`, `  rdfs:comment "Generated at design time from SAP metadata and reviewed against competency questions." .`, "");
+  L.push(`onto:sourceMetadata a owl:AnnotationProperty ;`, `  rdfs:comment "The metadata element this term was generated from." .`, "");
+  a.classes.forEach((c) => {
+    const parts = [`onto:${c.id} a owl:Class`, `rdfs:label "${esc(c.label)}"@en`];
+    if (c.comment) parts.push(`rdfs:comment "${esc(c.comment)}"@en`);
+    if (c.superClass) parts.push(`rdfs:subClassOf onto:${c.superClass}`);
+    if (c.source) parts.push(`onto:sourceMetadata "${esc(c.source)}"`);
+    L.push(parts.join(" ;\n  ") + " .", "");
+  });
+  a.oprops.forEach((p) => {
+    const types = ["owl:ObjectProperty"];
+    if (p.maxOne && !p.chain) types.push("owl:FunctionalProperty");
+    const parts = [`onto:${p.id} a ${types.join(", ")}`, `rdfs:label "${esc(p.label)}"@en`, `rdfs:domain onto:${p.domain}`, `rdfs:range onto:${p.range}`];
+    if (p.inverseOf) parts.push(`owl:inverseOf onto:${p.inverseOf}`);
+    if (p.chain) parts.push(`owl:propertyChainAxiom ( ${p.chain.map((x) => "onto:" + x).join(" ")} )`);
+    if (p.source) parts.push(`onto:sourceMetadata "${esc(p.source)}"`);
+    L.push(parts.join(" ;\n  ") + " .", "");
+  });
+  a.dprops.forEach((p) => {
+    const parts = [`onto:${p.id} a owl:DatatypeProperty, owl:FunctionalProperty`, `rdfs:label "${esc(p.label)}"@en`, `rdfs:domain onto:${p.domain}`, `rdfs:range ${p.range}`];
+    if (p.source) parts.push(`onto:sourceMetadata "${esc(p.source)}"`);
+    L.push(parts.join(" ;\n  ") + " .", "");
+  });
+  return L.join("\n");
+}
+
+function shapesTTL(onto, base) {
+  const a = accepted(onto);
+  const L = prefixBlock(base, [`@prefix sh: <${SH}> .`]);
+  a.classes.forEach((c) => {
+    const props = [
+      ...a.dprops.filter((p) => p.domain === c.id).map((p) => `[ sh:path onto:${p.id} ; sh:datatype ${p.range} ; sh:maxCount 1${p.key ? " ; sh:minCount 1" : ""} ]`),
+      ...a.oprops.filter((p) => p.domain === c.id && !p.chain).map((p) => `[ sh:path onto:${p.id} ; sh:class onto:${p.range}${p.maxOne ? " ; sh:maxCount 1" : ""} ]`),
+    ];
+    if (!props.length) return;
+    L.push(`onto:${c.id}Shape a sh:NodeShape ;\n  sh:targetClass onto:${c.id} ;\n  sh:property\n    ${props.join(" ,\n    ")} .`, "");
+  });
+  return L.join("\n");
+}
+
+function queriesRQ(cqs, base) {
+  return cqs.map((q, i) => {
+    const head = [`# Question ${i + 1}: ${q.text}`];
+    if (q.expected) head.push(`# Expected: ${q.expected}`);
+    if (q.verdict) head.push(`# Design-time test: ${q.verdict}${q.verdictNote ? " (" + q.verdictNote + ")" : ""}`);
+    if (!q.sparql) return [...head, `# Not answerable with this ontology.${q.missing ? " Missing: " + q.missing : ""}`].join("\n");
+    const body = /PREFIX\s+onto:/i.test(q.sparql) ? q.sparql : `PREFIX onto: <${base}>\n${q.sparql}`;
+    return [...head, body].join("\n");
+  }).join("\n\n") + "\n";
+}
+
+const shorten = (v, base) => v.startsWith(base) ? "onto:" + v.slice(base.length) : v.startsWith(DATA_BASE) ? "ex:" + v.slice(DATA_BASE.length) : v.startsWith(RDF) ? "rdf:" + v.slice(RDF.length) : v.startsWith(RDFS) ? "rdfs:" + v.slice(RDFS.length) : v.startsWith(XSD) ? "xsd:" + v.slice(XSD.length) : `<${v}>`;
+
+function sampleTTL(triples, base) {
+  const L = prefixBlock(base, [`@prefix ex: <${DATA_BASE}> .`]);
+  const bySubj = {};
+  triples.forEach((t) => (bySubj[t[0].v] = bySubj[t[0].v] || []).push(t));
+  Object.entries(bySubj).forEach(([s, ts]) => {
+    const parts = ts.map((t) => {
+      const pred = t[1].v === RDF + "type" ? "a" : shorten(t[1].v, base);
+      const obj = t[2].k === "i" ? shorten(t[2].v, base) : `"${esc(t[2].v)}"^^${shorten(t[2].dt, base)}`;
+      return `${pred} ${obj}`;
+    });
+    L.push(`${shorten(s, base)} ${parts.join(" ;\n  ")} .`, "");
+  });
+  return L.join("\n");
+}
+
+function decisionLogMD(log, cqs, title) {
+  const L = [`# Decision log: ${title}`, "", `Generated ${new Date().toISOString().slice(0, 10)}.`, "", "## Competency questions", ""];
+  cqs.forEach((q, i) => L.push(`${i + 1}. ${q.text}${q.expected ? ` (expected: ${q.expected})` : ""}${q.verdict ? ` [test: ${q.verdict}]` : ""}${!q.sparql && q.missing ? ` [gap: ${q.missing}]` : ""}`));
+  L.push("", "## Decisions", "");
+  log.forEach((e) => L.push(`- ${e.t.slice(0, 16).replace("T", " ")} | ${e.step} | ${e.by} | ${e.action}`));
+  return L.join("\n") + "\n";
+}
+
+// ---------- model prompts
+function describeOnto(onto) {
+  const a = accepted(onto);
+  return [
+    "Classes:",
+    ...a.classes.map((c) => `- ${c.id}${c.superClass ? ` subClassOf ${c.superClass}` : ""} "${c.label}"`),
+    "Object properties (domain -> range):",
+    ...a.oprops.map((p) => `- ${p.id}: ${p.domain} -> ${p.range}${p.maxOne ? " (at most one)" : ""}${p.inverseOf ? ` inverse of ${p.inverseOf}` : ""}${p.chain ? ` = chain(${p.chain.join(" then ")})` : ""}`),
+    "Datatype properties:",
+    ...a.dprops.slice(0, 150).map((p) => `- ${p.id}: ${p.domain} -> ${p.range} "${p.label}"`),
+  ].join("\n");
+}
+
+function describeScope(entities, scope) {
+  return entities.filter((e) => scope.includes(e.full)).map((e) =>
+    `${e.name}${e.label ? ` ("${e.label}")` : ""}: fields ${e.attrs.slice(0, 12).map((a) => a.name).join(", ")}; links ${e.assocs.map((a) => `${a.name} -> ${a.target}${a.many ? " (many)" : ""}`).join(", ") || "none"}`
+  ).join("\n");
+}
+
+function parseJSONLoose(text) {
+  const clean = String(text).replace(/```json|```/g, "").trim();
+  const s = clean.search(/[[{]/);
+  const e = Math.max(clean.lastIndexOf("}"), clean.lastIndexOf("]"));
+  if (s < 0 || e < s) throw new Error("The model didn't return JSON.");
+  return JSON.parse(clean.slice(s, e + 1));
+}
+
+// ---------------------------------------------------------------------------
+// Model calls
+// ---------------------------------------------------------------------------
+async function askClaude(prompt) {
+  if (!API_KEY) throw new Error("Add your Anthropic API key at the top of the page to use Claude.");
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({ model: MODEL, max_tokens: 4000, messages: [{ role: "user", content: prompt }] }),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try { const j = await res.json(); detail = j.error && j.error.message ? ` ${j.error.message}` : ""; } catch (e) {}
+    if (res.status === 401) throw new Error("The API key was rejected. Check it and paste it again.");
+    throw new Error(`The model request failed with status ${res.status}.${detail}`);
+  }
+  const data = await res.json();
+  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+function download(name, text) {
+  const blob = new Blob([text], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
+const CSS = `
+.wb{--paper:#EDF0F3;--panel:#FFFFFF;--ink:#1C2A36;--muted:#5B6B79;--rule:#CBD3DB;--accent:#1F6B5C;--accent-soft:#DCEBE6;--model:#4B5BA6;--model-soft:#E3E6F4;--warn:#8A5F0E;--warn-soft:#F5ECD8;--bad:#A23B3B;--bad-soft:#F4E1E1;
+  font-family:'IBM Plex Sans',system-ui,sans-serif;color:var(--ink);background:var(--paper);min-height:100vh;font-size:15px;line-height:1.5}
+.wb .mono{font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:13px}
+.wb h1{font-size:20px;font-weight:600;letter-spacing:-0.01em;margin:0}
+.wb h2{font-size:22px;font-weight:600;letter-spacing:-0.015em;margin:0 0 4px}
+.wb h3{font-size:15px;font-weight:600;margin:0 0 8px}
+.wb p{margin:0}
+.wb .lede{color:var(--muted);max-width:68ch}
+.wb .panel{background:var(--panel);border:1px solid var(--rule);border-radius:10px}
+.wb .btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule);background:var(--panel);color:var(--ink);border-radius:8px;padding:7px 12px;font:inherit;font-size:14px;font-weight:500;cursor:pointer}
+.wb .btn:hover{border-color:var(--ink)}
+.wb .btn:disabled{opacity:.45;cursor:not-allowed}
+.wb .btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.wb .btn-primary:hover{background:#185547;border-color:#185547}
+.wb .btn-model{background:var(--model);border-color:var(--model);color:#fff}
+.wb .btn-model:hover{background:#3C4A8C}
+.wb .btn-small{padding:4px 9px;font-size:13px}
+.wb button:focus-visible,.wb input:focus-visible,.wb textarea:focus-visible,.wb select:focus-visible,.wb [role=button]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.wb input[type=text],.wb textarea,.wb select{font:inherit;font-size:14px;color:var(--ink);background:#fff;border:1px solid var(--rule);border-radius:6px;padding:6px 8px;width:100%}
+.wb textarea.mono{font-size:12.5px;line-height:1.55}
+.wb .tag{display:inline-block;font-size:12px;padding:1px 7px;border-radius:999px;white-space:nowrap}
+.wb .o-metadata{background:#E6EAEE;color:#3C4B58}
+.wb .o-proposed{background:var(--model-soft);color:var(--model)}
+.wb .o-you{background:var(--accent-soft);color:var(--accent)}
+.wb .sev-error{background:var(--bad-soft);color:var(--bad)}
+.wb .sev-warn{background:var(--warn-soft);color:var(--warn)}
+.wb .sev-info{background:#E6EAEE;color:#3C4B58}
+.wb .term{font-family:'IBM Plex Mono',monospace;font-size:12px;background:#F1F4F6;border:1px solid #DDE3E8;border-radius:4px;padding:0 5px;white-space:nowrap}
+.wb .rail-step{display:flex;gap:10px;align-items:flex-start;text-align:left;width:100%;padding:9px 10px;border-radius:8px;border:0;background:transparent;font:inherit;color:var(--ink);cursor:pointer}
+.wb .rail-step:disabled{color:#98A4AF;cursor:not-allowed}
+.wb .rail-step.current{background:var(--panel);box-shadow:inset 3px 0 0 var(--accent)}
+.wb .rail-num{flex:none;width:22px;height:22px;border-radius:50%;border:1.5px solid currentColor;display:grid;place-items:center;font-size:12px;font-weight:600}
+.wb .rail-step.done .rail-num{background:var(--accent);border-color:var(--accent);color:#fff}
+.wb table{border-collapse:collapse;width:100%}
+.wb th{text-align:left;font-weight:500;color:var(--muted);font-size:13px;padding:6px 8px;border-bottom:1px solid var(--rule)}
+.wb td{padding:6px 8px;border-bottom:1px solid #E4E9ED;vertical-align:top;font-size:14px}
+.wb .row-off td{opacity:.45}
+.wb .tabs{display:flex;gap:4px;border-bottom:1px solid var(--rule);overflow-x:auto}
+.wb .tab{border:0;background:transparent;font:inherit;font-size:14px;padding:8px 12px;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap}
+.wb .tab.on{color:var(--ink);border-bottom-color:var(--ink);font-weight:500}
+.wb .drop{border:1.5px dashed #9AA8B4;border-radius:10px;padding:28px;text-align:center;background:#F7F9FA}
+.wb .drop.over{border-color:var(--accent);background:var(--accent-soft)}
+.wb .edge-label{font-family:'IBM Plex Mono',monospace;font-size:11px;fill:#4A5A68;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}
+.wb .node{cursor:pointer}
+.wb .node text{font-size:13px;font-weight:500;pointer-events:none}
+.wb .status-dot{width:9px;height:9px;border-radius:50%;flex:none;margin-top:7px}
+.wb pre.preview{max-height:320px;overflow:auto;background:#F7F9FA;border:1px solid var(--rule);border-radius:8px;padding:12px;margin:0;white-space:pre;font-size:12px}
+.wb .banner{border-radius:8px;padding:10px 12px;font-size:14px}
+@media (prefers-reduced-motion: no-preference){.wb .fresh{animation:wbIn .35s ease-out}@keyframes wbIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}}
+`;
+
+const STEPS = [
+  { key: "load", title: "Load metadata", sub: "CSN or OData EDMX" },
+  { key: "scope", title: "Scope and profile", sub: "Pick what to model" },
+  { key: "questions", title: "Questions", sub: "What must it answer?" },
+  { key: "propose", title: "Propose", sub: "Draft and coverage" },
+  { key: "review", title: "Review", sub: "Accept, edit, reject" },
+  { key: "test", title: "Test", sub: "Run the query pack" },
+  { key: "export", title: "Export", sub: "Turtle and queries" },
+];
+
+const ORIGIN_LABEL = { metadata: "metadata", proposed: "proposed", you: "yours" };
+const Origin = ({ o }) => <span className={`tag o-${o}`}>{ORIGIN_LABEL[o] || o}</span>;
+
+let cqSeq = 0;
+const newCq = (text = "", origin = "you") => ({ id: `cq${++cqSeq}`, text, expected: "", origin, sparql: "", answerable: null, missing: "", result: null, verdict: "", verdictNote: "" });
+
+// ---------------------------------------------------------------------------
+// Entity graph
+// ---------------------------------------------------------------------------
+function EntityGraph({ entities, scope, focus, onFocus }) {
+  const all = entities.filter((e) => scope.includes(e.full));
+  const nodes = all.slice(0, 16);
+  if (!nodes.length) return <div className="p-8 text-center" style={{ color: "var(--muted)" }}>Select entities to see how they connect.</div>;
+  const W = 800, H = 440, cx = W / 2, cy = H / 2;
+  const rx = nodes.length === 1 ? 0 : 300, ry = nodes.length <= 2 ? 0 : 165;
+  const start = nodes.length === 2 ? 0 : -Math.PI / 2;
+  const pos = {};
+  nodes.forEach((e, i) => {
+    const ang = start + (2 * Math.PI * i) / nodes.length;
+    pos[e.name] = { x: cx + rx * Math.cos(ang), y: cy + ry * Math.sin(ang), w: Math.min(200, e.name.length * 7.6 + 28), h: 34 };
+  });
+  const edges = [];
+  nodes.forEach((e) => e.assocs.forEach((a) => { if (pos[a.target] && a.target !== e.name) edges.push({ from: e.name, to: a.target, label: a.name.replace(/^_/, "") + (a.many ? " (many)" : ""), key: e.name + "." + a.name }); }));
+  const counts = {};
+  edges.forEach((ed) => {
+    const k = ed.from + ">" + ed.to;
+    counts[k] = (counts[k] || 0) + 1;
+    ed.idx = counts[k];
+    ed.rev = edges.some((o) => o.from === ed.to && o.to === ed.from);
+  });
+  const clip = (P, cxp, cyp) => {
+    const dx = P.x - cxp, dy = P.y - cyp;
+    const t = Math.min(0.92, Math.min((P.w / 2 + 5) / Math.max(Math.abs(dx), 1e-6), (P.h / 2 + 5) / Math.max(Math.abs(dy), 1e-6)));
+    return { x: P.x - dx * t, y: P.y - dy * t };
+  };
+  const rel = focus ? new Set(edges.filter((e) => e.from === focus || e.to === focus).map((e) => e.key)) : null;
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" role="img" aria-label="Relationships between the selected entities">
+        <defs>
+          <marker id="wbArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5B6B79" /></marker>
+          <marker id="wbArrowOn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1F6B5C" /></marker>
+        </defs>
+        {edges.map((ed) => {
+          const A = pos[ed.from], B = pos[ed.to];
+          const dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy) || 1;
+          const off = (ed.rev ? 26 : 0) + (ed.idx - 1) * 26;
+          const mx = (A.x + B.x) / 2 + (-dy / len) * off, my = (A.y + B.y) / 2 + (dx / len) * off;
+          const s = clip(A, mx, my), e = clip(B, mx, my);
+          const lx = 0.25 * s.x + 0.5 * mx + 0.25 * e.x, ly = 0.25 * s.y + 0.5 * my + 0.25 * e.y;
+          const on = rel && rel.has(ed.key);
+          const dim = rel && !on;
+          return (
+            <g key={ed.key} opacity={dim ? 0.25 : 1}>
+              <path d={`M${s.x},${s.y} Q${mx},${my} ${e.x},${e.y}`} fill="none" stroke={on ? "#1F6B5C" : "#8C99A5"} strokeWidth={on ? 2 : 1.4} markerEnd={`url(#${on ? "wbArrowOn" : "wbArrow"})`} />
+              <text x={lx} y={ly + 4} textAnchor="middle" className="edge-label">{ed.label}</text>
+            </g>
+          );
+        })}
+        {nodes.map((n) => {
+          const P = pos[n.name];
+          const on = focus === n.name;
+          return (
+            <g key={n.full} className="node" role="button" tabIndex={0} aria-label={`Show details for ${n.name}`} onClick={() => onFocus(on ? null : n.name)} onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onFocus(on ? null : n.name); } }}>
+              <rect x={P.x - P.w / 2} y={P.y - P.h / 2} width={P.w} height={P.h} rx={7} fill={on ? "#1F6B5C" : "#FFFFFF"} stroke={on ? "#1F6B5C" : "#1C2A36"} strokeWidth={1.3} />
+              <text x={P.x} y={P.y + 4.5} textAnchor="middle" fill={on ? "#FFFFFF" : "#1C2A36"}>{n.name}</text>
+            </g>
+          );
+        })}
+      </svg>
+      {all.length > nodes.length && <p className="text-sm px-4 pb-3" style={{ color: "var(--muted)" }}>Showing the first 16 of {all.length} selected entities.</p>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Small editable name field (commits on blur)
+// ---------------------------------------------------------------------------
+function NameField({ value, pattern, hint, onCommit }) {
+  const [draft, setDraft] = useState(value);
+  const [err, setErr] = useState("");
+  useEffect(() => setDraft(value), [value]);
+  const commit = () => {
+    const v = draft.trim();
+    if (v === value) { setErr(""); return; }
+    const problem = onCommit(v, pattern);
+    if (problem) { setErr(problem); setDraft(value); } else setErr("");
+  };
+  return (
+    <div>
+      <input type="text" className="mono" value={draft} aria-label={hint} onChange={(e) => setDraft(e.target.value)} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }} />
+      {err && <div className="text-xs mt-1" style={{ color: "var(--bad)" }}>{err}</div>}
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// API key bar (key is held in memory only, never stored)
+// ---------------------------------------------------------------------------
+function KeyBar() {
+  const [key, setKey] = useState("");
+  const [model, setModel] = useState(MODEL);
+  const [open, setOpen] = useState(true);
+  const set = (k) => { setKey(k); API_KEY = k.trim(); };
+  const setM = (m) => { setModel(m); MODEL = m.trim(); };
+  if (!open && key) return (
+    <div className="w-full flex items-center gap-2 text-sm" style={{ color: "var(--muted)" }}>
+      <span className="tag o-you">Claude connected</span><span className="mono">{model}</span>
+      <button className="btn btn-small" onClick={() => setOpen(true)}>Change</button>
+    </div>
+  );
+  return (
+    <div className="w-full flex flex-wrap items-end gap-2 mt-2">
+      <label className="text-sm flex-1" style={{ minWidth: 220 }}>Anthropic API key
+        <input type="password" className="mono mt-1" value={key} placeholder="sk-ant-..." autoComplete="off" onChange={(e) => set(e.target.value)} />
+      </label>
+      <label className="text-sm" style={{ width: 200 }}>Model
+        <input type="text" className="mono mt-1" value={model} onChange={(e) => setM(e.target.value)} />
+      </label>
+      <button className="btn btn-primary" disabled={!key.trim()} onClick={() => setOpen(false)}>Use this key</button>
+      <p className="w-full text-xs" style={{ color: "var(--muted)" }}>The key stays in this tab's memory and is sent only to api.anthropic.com. Closing or reloading the tab clears it. Everything except the Claude buttons works without a key.</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+function App() {
+  const [step, setStep] = useState(0);
+  const [source, setSource] = useState(null);
+  const [ingestError, setIngestError] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+  const [scope, setScope] = useState([]);
+  const [focus, setFocus] = useState(null);
+  const [filter, setFilter] = useState("");
+  const [base, setBase] = useState(DEFAULT_BASE);
+  const [title, setTitle] = useState("Sales and partner ontology");
+  const [cqs, setCqs] = useState([]);
+  const [onto, setOnto] = useState(null);
+  const [ontoScope, setOntoScope] = useState("");
+  const [skipped, setSkipped] = useState([]);
+  const [notes, setNotes] = useState([]);
+  const [log, setLog] = useState([]);
+  const [busy, setBusy] = useState("");
+  const [apiError, setApiError] = useState("");
+  const [triples, setTriples] = useState(null);
+  const [perClass, setPerClass] = useState(4);
+  const [tab, setTab] = useState("classes");
+  const [openFile, setOpenFile] = useState(null);
+  const [copied, setCopied] = useState("");
+  const fileRef = useRef(null);
+
+  const addLog = (stepName, action, by = "you") => setLog((l) => [...l, { t: new Date().toISOString(), step: stepName, action, by }]);
+
+  const unlocked = [true, !!source, !!source && scope.length > 0, cqs.some((q) => q.text.trim()), !!onto, !!onto, !!onto];
+  const done = [!!source, scope.length > 0 && !!onto, cqs.some((q) => q.text.trim()) && !!onto, !!onto && cqs.some((q) => q.sparql), !!onto && log.some((e) => e.step === "Review"), cqs.some((q) => q.verdict), false];
+
+  const knownIds = useMemo(() => (onto ? new Set([...accepted(onto).classes, ...accepted(onto).oprops, ...accepted(onto).dprops].map((x) => x.id)) : new Set()), [onto]);
+  const checks = useMemo(() => (onto ? lint(onto, cqs) : []), [onto, cqs]);
+  const scopeStale = onto && ontoScope !== [...scope].sort().join("|");
+
+  // ----- ingest
+  const ingestText = (text, fileName, preselect) => {
+    setIngestError("");
+    try {
+      const trimmed = text.trim();
+      let entities, format;
+      if (trimmed.startsWith("{")) {
+        let json;
+        try { json = JSON.parse(trimmed); } catch (e) { throw new Error("The file looks like JSON but doesn't parse. Check that it's a complete CSN export."); }
+        if (!json.definitions) throw new Error('This JSON has no "definitions" object, so it isn\'t CSN. Export CSN (for example with cds compile --to csn) or upload an OData $metadata file.');
+        entities = parseCSN(json);
+        format = "CSN";
+      } else if (trimmed.startsWith("<")) {
+        entities = parseEDMX(trimmed);
+        format = "OData EDMX";
+      } else throw new Error("The file isn't JSON or XML. Upload a CSN .json file or an OData $metadata .xml or .edmx file.");
+      if (!entities.length) throw new Error(`No entities were found in this ${format} file.`);
+      setSource({ fileName, format, entities });
+      setScope(preselect ? entities.map((e) => e.full) : []);
+      setFocus(null);
+      setOnto(null);
+      setTriples(null);
+      setCqs((qs) => qs.map((q) => ({ ...q, sparql: "", answerable: null, missing: "", result: null, verdict: "" })));
+      addLog("Load", `Loaded ${fileName} (${format}, ${entities.length} entities).`, "tool");
+      setStep(1);
+    } catch (e) {
+      setIngestError(e.message || String(e));
+    }
+  };
+  const readFile = async (file) => { if (file) ingestText(await file.text(), file.name, false); };
+
+  // ----- scope
+  const toggleScope = (full) => setScope((s) => (s.includes(full) ? s.filter((x) => x !== full) : [...s, full]));
+  const visibleEntities = source ? source.entities.filter((e) => !filter || (e.name + " " + e.label).toLowerCase().includes(filter.toLowerCase())) : [];
+  const focusEntity = source && focus ? source.entities.find((e) => e.name === focus) : null;
+
+  // ----- questions
+  const suggestQuestions = async () => {
+    setApiError("");
+    setBusy("Suggesting questions…");
+    try {
+      const prompt = `You are helping design a knowledge graph ontology from SAP metadata. These are the entities in scope:\n${describeScope(source.entities, scope)}\n\nExisting competency questions:\n${cqs.map((q) => "- " + q.text).join("\n") || "(none)"}\n\nSuggest 5 new competency questions a business user would ask of a knowledge graph built from these entities. Each under 20 words, in plain business language, not repeating existing ones. Include at least two that need to follow two or more relationships, and one that the metadata probably cannot answer on its own. Respond with only a JSON array of strings.`;
+      const list = parseJSONLoose(await askClaude(prompt));
+      if (!Array.isArray(list)) throw new Error("The model's suggestions weren't a list.");
+      const added = list.filter((x) => typeof x === "string" && x.trim()).slice(0, 6).map((x) => newCq(x.trim(), "proposed"));
+      setCqs((qs) => [...qs, ...added]);
+      addLog("Questions", `Claude suggested ${added.length} questions.`, "model");
+    } catch (e) {
+      setApiError(`Suggestions failed: ${e.message}`);
+    }
+    setBusy("");
+  };
+
+  // ----- propose
+  const buildBase = () => {
+    const r = buildBaseline(source.entities, scope);
+    setOnto(r.onto);
+    setSkipped(r.skipped);
+    setNotes([]);
+    setTriples(null);
+    setOntoScope([...scope].sort().join("|"));
+    setCqs((qs) => qs.map((q) => ({ ...q, sparql: "", answerable: null, missing: "", result: null, verdict: "" })));
+    addLog("Propose", `Built the baseline from metadata: ${r.onto.classes.length} classes, ${r.onto.oprops.length} relationships, ${r.onto.dprops.length} attributes.`, "tool");
+    return r.onto;
+  };
+
+  const mapQuestions = async (current) => {
+    const list = cqs.filter((q) => q.text.trim());
+    for (let i = 0; i < list.length; i++) {
+      const q = list[i];
+      setBusy(`Mapping question ${i + 1} of ${list.length}…`);
+      try {
+        const prompt = `You map a business question to SPARQL over this ontology. Prefix: onto: <${base}>. Also available: rdf:, rdfs:, xsd:.\n${describeOnto(current)}\n\nQuestion: "${q.text}"\n\nRules for the SPARQL: SELECT with plain variables only (DISTINCT and LIMIT allowed); WHERE contains only triple patterns (use "a" for rdf:type, ";" allowed) and FILTER with =, !=, <, >, <=, >=, &&, ||, !, CONTAINS, LCASE, STR, REGEX. No OPTIONAL, UNION, BIND, VALUES, subqueries, GROUP BY, or aggregates: return the rows instead of counting. Use only terms listed above. Include the PREFIX line for onto.\nIf the ontology cannot answer the question, set answerable to false, sparql to "", and say briefly what concept or data is missing.\nRespond with only JSON: {"answerable": true|false, "sparql": "...", "missing": "..."}`;
+        const r = parseJSONLoose(await askClaude(prompt));
+        setCqs((qs) => qs.map((x) => (x.id === q.id ? { ...x, answerable: !!r.answerable, sparql: r.answerable ? String(r.sparql || "") : "", missing: String(r.missing || ""), result: null, verdict: "" } : x)));
+        addLog("Propose", r.answerable ? `Mapped question "${q.text}" to SPARQL.` : `Logged a gap for "${q.text}": ${r.missing || "no reason given"}.`, "model");
+      } catch (e) {
+        setCqs((qs) => qs.map((x) => (x.id === q.id ? { ...x, answerable: null, missing: `Mapping failed: ${e.message}` } : x)));
+      }
+    }
+  };
+
+  const refineWithClaude = async () => {
+    setApiError("");
+    let current = onto || buildBase();
+    setBusy("Asking Claude to refine the baseline…");
+    try {
+      const prompt = `You refine an ontology that was generated mechanically from SAP CDS metadata. Follow Noy and McGuinness, Ontology Development 101: model only what the competency questions need; add a superclass only when it groups at least two classes or a question needs it; distinctions that things move in and out of are property values, not classes.\n\n${describeOnto(current)}\n\nCompetency questions:\n${cqs.filter((q) => q.text.trim()).map((q, i) => `${i + 1}. ${q.text}`).join("\n")}\n\nReturn only JSON with this shape, keeping it short:\n{"renames":[{"id":"oldPropertyId","newId":"lowerCamelVerb","label":"plain label"}],\n "superclasses":[{"class":"ExistingClassId","superClass":"PascalCaseId","label":"plain label","comment":"why"}],\n "derived":[{"id":"lowerCamelId","label":"plain label","domain":"ClassId","range":"ClassId","chain":["existingPropId","existingPropId"]}],\n "notes":[{"term":"id","note":"one sentence"}]}\nRenames: only object properties whose names are technical navigation paths; give business verbs like placedBy or suppliedBy. Derived: only when a question needs a multi-hop shortcut; each chain step must be an existing object property id (use the NEW id if you renamed it) and the steps must connect range to domain. At most 6 items per list.`;
+      const r = parseJSONLoose(await askClaude(prompt));
+      let o = current;
+      let q = cqs;
+      const applied = [];
+      (r.renames || []).forEach((x) => {
+        const p = o.oprops.find((y) => y.id === x.id);
+        if (!p || !/^[a-z][A-Za-z0-9]*$/.test(x.newId || "") || [...o.classes, ...o.oprops, ...o.dprops].some((y) => y.id === x.newId)) return;
+        const rr = renameTerm(o, q, x.id, x.newId);
+        o = rr.onto; q = rr.cqs;
+        o = { ...o, oprops: o.oprops.map((y) => (y.id === x.newId ? { ...y, label: x.label || y.label, renamedFrom: x.id } : y)) };
+        applied.push(`Renamed ${x.id} to ${x.newId}.`);
+      });
+      (r.superclasses || []).forEach((x) => {
+        if (!o.classes.find((c) => c.id === x.class) || !/^[A-Z][A-Za-z0-9]*$/.test(x.superClass || "") || x.superClass === x.class) return;
+        if (!o.classes.find((c) => c.id === x.superClass)) {
+          o = { ...o, classes: [...o.classes, { id: x.superClass, label: x.label || humanize(x.superClass), comment: x.comment || "", superClass: "", source: "", origin: "proposed", accepted: true }] };
+        }
+        o = { ...o, classes: o.classes.map((c) => (c.id === x.class ? { ...c, superClass: x.superClass, superOrigin: "proposed" } : c)) };
+        applied.push(`Placed ${x.class} under ${x.superClass}.`);
+      });
+      (r.derived || []).forEach((x) => {
+        if (!/^[a-z][A-Za-z0-9]*$/.test(x.id || "") || [...o.classes, ...o.oprops, ...o.dprops].some((y) => y.id === x.id)) return;
+        if (!Array.isArray(x.chain) || x.chain.length < 2 || !x.chain.every((s) => o.oprops.find((p) => p.id === s))) return;
+        o = { ...o, oprops: [...o.oprops, { id: x.id, label: x.label || humanize(x.id), domain: x.domain, range: x.range, maxOne: false, inverseOf: "", chain: x.chain, source: "", origin: "proposed", accepted: true }] };
+        applied.push(`Added the shortcut ${x.id} (${x.chain.join(" then ")}).`);
+      });
+      setOnto(o);
+      setCqs(q);
+      setNotes(Array.isArray(r.notes) ? r.notes.filter((n) => n && n.note) : []);
+      addLog("Propose", applied.length ? `Claude proposed: ${applied.join(" ")}` : "Claude proposed no structural changes.", "model");
+      current = o;
+    } catch (e) {
+      setApiError(`Refinement failed: ${e.message} The baseline is unchanged; you can still map the questions.`);
+    }
+    await mapQuestions(current);
+    setBusy("");
+  };
+
+  const mapOnly = async () => {
+    setApiError("");
+    const current = onto || buildBase();
+    await mapQuestions(current);
+    setBusy("");
+  };
+
+  // ----- review edits
+  const kindOf = (k) => (k === "classes" ? "class" : k === "oprops" ? "relationship" : "attribute");
+  const patchItem = (kind, id, patch, logMsg) => {
+    setOnto((o) => ({ ...o, [kind]: o[kind].map((x) => (x.id === id ? { ...x, ...patch } : x)) }));
+    if (logMsg) addLog("Review", logMsg);
+  };
+  const renameItem = (kind, oldId, newId, pattern) => {
+    if (!pattern.test(newId)) return kind === "classes" ? "Class names start with a capital letter and use letters and digits only." : "Property names start with a lowercase letter and use letters and digits only.";
+    if (knownIds.has(newId) || [...onto.classes, ...onto.oprops, ...onto.dprops].some((x) => x.id === newId)) return `${newId} is already taken.`;
+    const r = renameTerm(onto, cqs, oldId, newId);
+    setOnto(r.onto);
+    setCqs(r.cqs);
+    addLog("Review", `Renamed ${kindOf(kind)} ${oldId} to ${newId}.`);
+    return "";
+  };
+  const addItem = (kind) => {
+    const a = accepted(onto);
+    const first = a.classes[0] ? a.classes[0].id : "";
+    const taken = new Set([...onto.classes, ...onto.oprops, ...onto.dprops].map((x) => x.id));
+    const stem = kind === "classes" ? "NewClass" : kind === "oprops" ? "newRelationship" : "newAttribute";
+    let id = stem, k = 2;
+    while (taken.has(id)) id = stem + k++;
+    const item = kind === "classes"
+      ? { id, label: humanize(id), comment: "", superClass: "", source: "", origin: "you", accepted: true }
+      : kind === "oprops"
+        ? { id, label: humanize(id), domain: first, range: first, maxOne: false, inverseOf: "", chain: null, source: "", origin: "you", accepted: true }
+        : { id, label: humanize(id), domain: first, range: "xsd:string", key: false, source: "", origin: "you", accepted: true };
+    setOnto((o) => ({ ...o, [kind]: [...o[kind], item] }));
+    addLog("Review", `Added ${kindOf(kind)} ${id}.`);
+  };
+
+  // ----- test
+  const generateData = () => {
+    const t = synthesize(onto, base, DATA_BASE, perClass);
+    setTriples(t);
+    setCqs((qs) => qs.map((q) => ({ ...q, result: null })));
+    addLog("Test", `Generated ${t.length} sample triples (${perClass} per class).`, "tool");
+  };
+  const runOne = (q, t) => {
+    const data = t || triples;
+    try {
+      const r = runQuery(q.sparql, data, base, knownIds);
+      return { ...q, result: { ...r, error: "" } };
+    } catch (e) {
+      return { ...q, result: { vars: [], rows: [], unknown: [], error: e.message } };
+    }
+  };
+  const runAll = () => {
+    let t = triples;
+    if (!t) { t = synthesize(onto, base, DATA_BASE, perClass); setTriples(t); addLog("Test", `Generated ${t.length} sample triples (${perClass} per class).`, "tool"); }
+    setCqs((qs) => qs.map((q) => (q.sparql ? runOne(q, t) : q)));
+  };
+  const setVerdict = (id, verdict) => {
+    setCqs((qs) => qs.map((q) => (q.id === id ? { ...q, verdict } : q)));
+    const q = cqs.find((x) => x.id === id);
+    addLog("Test", `Marked "${q.text}" as ${verdict}.`);
+  };
+
+  // ----- export
+  const files = useMemo(() => {
+    if (!onto) return [];
+    const list = [
+      { name: "ontology.ttl", desc: "Classes, relationships and attributes as OWL in Turtle.", text: ontologyTTL(onto, base, title) },
+      { name: "shapes.ttl", desc: "SHACL shapes for validating data against the ontology.", text: shapesTTL(onto, base) },
+      { name: "queries.rq", desc: "One SPARQL query per question, with gaps and test results as comments.", text: queriesRQ(cqs.filter((q) => q.text.trim()), base) },
+      { name: "decision-log.md", desc: "Every decision made in this session and who made it.", text: decisionLogMD(log, cqs.filter((q) => q.text.trim()), title) },
+    ];
+    if (triples) list.push({ name: "sample-data.ttl", desc: "The synthetic test data. For design checks only, not for loading as real data.", text: sampleTTL(triples, base) });
+    return list;
+  }, [onto, base, title, cqs, log, triples]);
+
+  const copy = async (f) => {
+    try { await navigator.clipboard.writeText(f.text); setCopied(f.name); setTimeout(() => setCopied(""), 1600); }
+    catch (e) { setOpenFile(f.name); }
+  };
+
+  // ------------------------------------------------------------------------
+  // Render helpers
+  // ------------------------------------------------------------------------
+  const Busy = () => busy ? <div className="banner mb-4" style={{ background: "var(--model-soft)", color: "var(--model)" }} role="status">{busy}</div> : null;
+  const ApiErr = () => apiError ? <div className="banner mb-4" style={{ background: "var(--bad-soft)", color: "var(--bad)" }} role="alert">{apiError}</div> : null;
+  const Next = ({ to, label, disabled }) => (
+    <div className="mt-6 flex justify-end"><button className="btn btn-primary" disabled={disabled} onClick={() => setStep(to)}>{label}</button></div>
+  );
+  const sourceOf = (id) => {
+    if (!onto) return "";
+    const c = onto.classes.find((x) => x.id === id);
+    if (c) return c.source ? localName(c.source) : "proposed";
+    const p = onto.oprops.find((x) => x.id === id) || onto.dprops.find((x) => x.id === id);
+    if (!p) return "";
+    if (p.chain) return "derived";
+    return p.source ? localName(p.source.split(".").slice(0, -1).join(".")) : "proposed";
+  };
+  const termsIn = (sparql) => [...new Set((sparql.match(/onto:[A-Za-z][A-Za-z0-9_]*/g) || []).map((x) => x.slice(5)))];
+
+  // ------------------------------------------------------------------------
+  // Steps
+  // ------------------------------------------------------------------------
+  const renderLoad = () => (
+    <div>
+      <h2>Load the metadata</h2>
+      <p className="lede mb-5">Start from what the system already knows about itself. Upload a CSN file or an OData $metadata document; nothing leaves this page except the parts you later send to Claude.</p>
+      <div
+        className={`drop ${dragOver ? "over" : ""}`}
+        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => { e.preventDefault(); setDragOver(false); readFile(e.dataTransfer.files[0]); }}
+      >
+        <p className="mb-3 font-medium">Drop a .json, .csn, .xml or .edmx file here</p>
+        <div className="flex flex-wrap gap-2 justify-center">
+          <button className="btn btn-primary" onClick={() => fileRef.current && fileRef.current.click()}>Choose a file</button>
+          <button className="btn" onClick={() => ingestText(JSON.stringify(SAMPLE_CSN), "sample-sales.csn.json", true)}>Use the sample sales model</button>
+        </div>
+        <input ref={fileRef} type="file" accept=".json,.csn,.xml,.edmx" className="hidden" onChange={(e) => readFile(e.target.files[0])} />
+      </div>
+      {ingestError && <div className="banner mt-4" style={{ background: "var(--bad-soft)", color: "var(--bad)" }} role="alert">{ingestError}</div>}
+      <p className="text-sm mt-4" style={{ color: "var(--muted)" }}>The sample is a small, hand-made CSN in the shape of an S/4 sales model: business partners and roles, sales orders and items, products, purchasing info records, plants and maintenance orders.</p>
+    </div>
+  );
+
+  const renderScope = () => (
+    <div>
+      <h2>Scope and profile</h2>
+      <p className="lede mb-5">Model a slice, not the whole system. Pick the entities your questions will be about; the graph shows how the metadata links them.</p>
+      {source && <p className="text-sm mb-4" style={{ color: "var(--muted)" }}>{source.fileName}: {source.format}, {source.entities.length} entities, {scope.length} selected.</p>}
+      {scopeStale && <div className="banner mb-4" style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>The scope changed after the baseline was built. Rebuild the baseline in Propose to include the change.</div>}
+      <div className="flex flex-col lg:flex-row gap-4">
+        <div className="panel p-3 lg:w-64 flex-none">
+          <input type="text" placeholder="Filter entities" value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter entities" />
+          <div className="flex gap-2 my-2">
+            <button className="btn btn-small" onClick={() => setScope((s) => [...new Set([...s, ...visibleEntities.map((e) => e.full)])])}>Select shown</button>
+            <button className="btn btn-small" onClick={() => setScope([])}>Clear</button>
+          </div>
+          <div style={{ maxHeight: 360, overflowY: "auto" }}>
+            {visibleEntities.map((e) => (
+              <label key={e.full} className="flex gap-2 items-start py-1 cursor-pointer text-sm">
+                <input type="checkbox" className="mt-1" checked={scope.includes(e.full)} onChange={() => toggleScope(e.full)} />
+                <span><span className="font-medium">{e.name}</span><br /><span style={{ color: "var(--muted)" }}>{e.attrs.length} fields, {e.assocs.length} links</span></span>
+              </label>
+            ))}
+            {!visibleEntities.length && <p className="text-sm py-2" style={{ color: "var(--muted)" }}>No entity matches that filter.</p>}
+          </div>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="panel"><EntityGraph entities={source.entities} scope={scope} focus={focus} onFocus={setFocus} /></div>
+          {focusEntity ? (
+            <div className="panel p-4 mt-4 fresh">
+              <h3>{focusEntity.name}{focusEntity.label ? ` (${focusEntity.label})` : ""}</h3>
+              <p className="text-sm mb-3" style={{ color: "var(--muted)" }}>Key: {focusEntity.keys.join(", ") || "none declared"}{focusEntity.annotations.length ? `. Annotations: ${focusEntity.annotations.join(", ")}` : ""}.</p>
+              <div className="overflow-x-auto">
+                <table>
+                  <thead><tr><th>Field</th><th>Type</th><th>Label</th></tr></thead>
+                  <tbody>{focusEntity.attrs.map((a) => <tr key={a.name}><td className="mono">{a.name}{a.key ? " (key)" : ""}</td><td className="mono">{a.type}</td><td>{a.label}</td></tr>)}</tbody>
+                </table>
+              </div>
+              {focusEntity.assocs.length > 0 && (
+                <div className="overflow-x-auto mt-3">
+                  <table>
+                    <thead><tr><th>Link</th><th>Target</th><th>Cardinality</th></tr></thead>
+                    <tbody>{focusEntity.assocs.map((a) => (
+                      <tr key={a.name}><td className="mono">{a.name}</td><td className="mono">{a.target}{!scope.some((s) => localName(s) === a.target) ? " (outside scope)" : ""}</td><td>{a.many ? "to many" : "to one"}{a.composition ? ", composition" : ""}</td></tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : scope.length > 0 && <p className="text-sm mt-3" style={{ color: "var(--muted)" }}>Select an entity in the graph to see its fields, keys and links.</p>}
+        </div>
+      </div>
+      <Next to={2} label="Continue to questions" disabled={!scope.length} />
+    </div>
+  );
+
+  const renderQuestions = () => (
+    <div>
+      <h2>What should the graph answer?</h2>
+      <p className="lede mb-5">These competency questions set the scope and become the test suite. Ask what the business needs, even if you doubt the metadata covers it; unanswerable questions are logged as gaps, and they point to the next source to connect.</p>
+      <Busy /><ApiErr />
+      <div className="flex flex-col gap-3">
+        {cqs.map((q, i) => (
+          <div key={q.id} className="panel p-3">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-sm font-medium" style={{ color: "var(--muted)" }}>Question {i + 1}</span>
+              <Origin o={q.origin} />
+              <span className="flex-1" />
+              <button className="btn btn-small" onClick={() => { setCqs((qs) => qs.filter((x) => x.id !== q.id)); addLog("Questions", `Removed "${q.text || "empty question"}".`); }}>Remove</button>
+            </div>
+            <textarea rows={2} value={q.text} placeholder="For example: Which customers ordered products that come from a blocked supplier?" aria-label={`Question ${i + 1}`}
+              onChange={(e) => { const v = e.target.value; setCqs((qs) => qs.map((x) => (x.id === q.id ? { ...x, text: v, origin: x.origin === "proposed" ? "you" : x.origin } : x))); }} />
+            <input type="text" className="mt-2" value={q.expected} placeholder="What should a correct answer contain? (optional, used when testing)" aria-label={`Expected answer for question ${i + 1}`}
+              onChange={(e) => { const v = e.target.value; setCqs((qs) => qs.map((x) => (x.id === q.id ? { ...x, expected: v } : x))); }} />
+          </div>
+        ))}
+        {!cqs.length && <div className="panel p-5 text-center" style={{ color: "var(--muted)" }}>No questions yet. Write the first one, or ask Claude for suggestions based on the entities you picked.</div>}
+      </div>
+      <div className="flex flex-wrap gap-2 mt-4">
+        <button className="btn" onClick={() => setCqs((qs) => [...qs, newCq()])}>Add a question</button>
+        <button className="btn btn-model" disabled={!!busy} onClick={suggestQuestions}>Suggest questions with Claude</button>
+      </div>
+      <Next to={3} label="Continue to propose" disabled={!cqs.some((q) => q.text.trim())} />
+    </div>
+  );
+
+  const renderPropose = () => {
+    const a = onto ? accepted(onto) : null;
+    const asked = cqs.filter((q) => q.text.trim());
+    const gaps = asked.filter((q) => q.answerable === false);
+    return (
+      <div>
+        <h2>Propose the ontology</h2>
+        <p className="lede mb-5">The baseline is a mechanical translation of the metadata. Claude then renames technical links, suggests groupings and multi-hop shortcuts, and maps each question to SPARQL. Every proposal is marked so you can judge it in Review.</p>
+        <Busy /><ApiErr />
+        {scopeStale && <div className="banner mb-4" style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>The scope changed after this baseline was built. Rebuilding replaces the current proposal.</div>}
+        <div className="flex flex-wrap gap-2 mb-5">
+          <button className="btn" disabled={!!busy} onClick={buildBase}>{onto ? "Rebuild the baseline" : "Build the baseline"}</button>
+          <button className="btn btn-model" disabled={!!busy} onClick={refineWithClaude}>Refine and map with Claude</button>
+          <button className="btn" disabled={!!busy} onClick={mapOnly}>Map questions only</button>
+        </div>
+        {a && (
+          <div className="panel p-4 mb-4">
+            <p className="text-sm">
+              {a.classes.length} classes, {a.oprops.length} relationships, {a.dprops.length} attributes.{" "}
+              {(() => { const n = [...onto.classes, ...onto.oprops].filter((x) => x.origin === "proposed" || x.renamedFrom || x.superOrigin === "proposed").length; return n > 0 ? <span style={{ color: "var(--model)" }}>{n} changes proposed by Claude.</span> : null; })()}
+            </p>
+          </div>
+        )}
+        {onto && (
+          <div>
+            <h3>Coverage</h3>
+            <div className="panel">
+              {asked.map((q, i) => {
+                const terms = q.sparql ? termsIn(q.sparql) : [];
+                const sources = [...new Set(terms.map(sourceOf).filter(Boolean))];
+                const color = q.answerable === true ? "var(--accent)" : q.answerable === false ? "var(--warn)" : "#A9B4BE";
+                return (
+                  <div key={q.id} className="flex gap-3 p-3" style={{ borderTop: i ? "1px solid #E4E9ED" : 0 }}>
+                    <span className="status-dot" style={{ background: color }} aria-hidden="true" />
+                    <div className="min-w-0">
+                      <p className="font-medium">{q.text}</p>
+                      {q.answerable === true && (
+                        <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>
+                          Uses {terms.map((t) => <span key={t} className="term mr-1">{t}</span>)}{sources.length > 0 && <span> from {sources.join(", ")}</span>}
+                        </p>
+                      )}
+                      {q.answerable === false && <p className="text-sm mt-1" style={{ color: "var(--warn)" }}>Gap: {q.missing || "the ontology can't answer this."}</p>}
+                      {q.answerable === null && <p className="text-sm mt-1" style={{ color: "var(--muted)" }}>{q.missing || "Not mapped yet."}</p>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {gaps.length > 0 && (
+              <div className="panel p-4 mt-4" style={{ borderColor: "#E2CFA3" }}>
+                <h3>Gaps</h3>
+                <p className="text-sm mb-2" style={{ color: "var(--muted)" }}>These questions need concepts or data the metadata doesn't contain. Each one names the next source or connector to add.</p>
+                <ul className="text-sm list-disc pl-5">{gaps.map((q) => <li key={q.id}>{q.text}: {q.missing}</li>)}</ul>
+              </div>
+            )}
+            {notes.length > 0 && (
+              <div className="panel p-4 mt-4">
+                <h3>Claude's notes</h3>
+                <ul className="text-sm list-disc pl-5">{notes.map((n, i) => <li key={i}><span className="term">{n.term}</span> {n.note}</li>)}</ul>
+              </div>
+            )}
+            {skipped.length > 0 && (
+              <details className="mt-4">
+                <summary className="text-sm cursor-pointer" style={{ color: "var(--muted)" }}>Left out of the baseline ({skipped.length})</summary>
+                <ul className="text-sm list-disc pl-5 mt-2">{skipped.map((s, i) => <li key={i}>{s}</li>)}</ul>
+              </details>
+            )}
+          </div>
+        )}
+        <Next to={4} label="Continue to review" disabled={!onto} />
+      </div>
+    );
+  };
+
+  const renderReview = () => {
+    const a = accepted(onto);
+    const classOpts = a.classes.map((c) => c.id);
+    const errs = checks.filter((c) => c.sev === "error").length;
+    const toggle = (kind, x) => patchItem(kind, x.id, { accepted: !x.accepted }, `${x.accepted ? "Rejected" : "Accepted"} ${kindOf(kind)} ${x.id}.`);
+    const Sel = ({ value, opts, onChange, label }) => (
+      <select value={value} aria-label={label} onChange={(e) => onChange(e.target.value)}>
+        {!opts.includes(value) && <option value={value}>{value || "(none)"}</option>}
+        {opts.map((o) => <option key={o || "none"} value={o}>{o || "(none)"}</option>)}
+      </select>
+    );
+    return (
+      <div>
+        <h2>Review</h2>
+        <p className="lede mb-5">You decide what goes in. Rejected items stay visible but are left out of tests and exports. Renaming updates every reference, including the SPARQL.</p>
+        <div className="tabs mb-4" role="tablist">
+          {[["classes", `Classes (${a.classes.length})`], ["oprops", `Relationships (${a.oprops.length})`], ["dprops", `Attributes (${a.dprops.length})`], ["checks", `Checks (${checks.length})`]].map(([k, l]) => (
+            <button key={k} role="tab" aria-selected={tab === k} className={`tab ${tab === k ? "on" : ""}`} onClick={() => setTab(k)}>
+              {l}{k === "checks" && errs > 0 && <span className="tag sev-error ml-2">{errs} to fix</span>}
+            </button>
+          ))}
+        </div>
+        {tab === "classes" && (
+          <div className="overflow-x-auto">
+            <table>
+              <thead><tr><th>Keep</th><th style={{ minWidth: 170 }}>Name</th><th style={{ minWidth: 150 }}>Label</th><th style={{ minWidth: 150 }}>Parent</th><th>Origin</th></tr></thead>
+              <tbody>{onto.classes.map((c) => (
+                <tr key={c.id} className={c.accepted ? "" : "row-off"}>
+                  <td><input type="checkbox" checked={c.accepted} onChange={() => toggle("classes", c)} aria-label={`Keep ${c.id}`} /></td>
+                  <td><NameField value={c.id} hint={`Name of ${c.id}`} pattern={/^[A-Z][A-Za-z0-9]*$/} onCommit={(v, p) => renameItem("classes", c.id, v, p)} /></td>
+                  <td><input type="text" value={c.label} aria-label={`Label of ${c.id}`} onChange={(e) => patchItem("classes", c.id, { label: e.target.value })} /></td>
+                  <td>
+                    <Sel value={c.superClass} label={`Parent of ${c.id}`} opts={["", ...classOpts.filter((x) => x !== c.id)]} onChange={(v) => patchItem("classes", c.id, { superClass: v, superOrigin: "you" }, `Set the parent of ${c.id} to ${v || "none"}.`)} />
+                    {c.superOrigin === "proposed" && <div className="mt-1"><Origin o="proposed" /></div>}
+                  </td>
+                  <td><Origin o={c.origin} /></td>
+                </tr>
+              ))}</tbody>
+            </table>
+            <button className="btn btn-small mt-3" onClick={() => addItem("classes")}>Add a class</button>
+          </div>
+        )}
+        {tab === "oprops" && (
+          <div className="overflow-x-auto">
+            <table>
+              <thead><tr><th>Keep</th><th style={{ minWidth: 170 }}>Name</th><th style={{ minWidth: 140 }}>From</th><th style={{ minWidth: 140 }}>To</th><th>At most one</th><th>Notes</th><th>Origin</th></tr></thead>
+              <tbody>{onto.oprops.map((p) => (
+                <tr key={p.id} className={p.accepted ? "" : "row-off"}>
+                  <td><input type="checkbox" checked={p.accepted} onChange={() => toggle("oprops", p)} aria-label={`Keep ${p.id}`} /></td>
+                  <td><NameField value={p.id} hint={`Name of ${p.id}`} pattern={/^[a-z][A-Za-z0-9]*$/} onCommit={(v, pt) => renameItem("oprops", p.id, v, pt)} /></td>
+                  <td><Sel value={p.domain} label={`Domain of ${p.id}`} opts={classOpts} onChange={(v) => patchItem("oprops", p.id, { domain: v }, `Set the domain of ${p.id} to ${v}.`)} /></td>
+                  <td><Sel value={p.range} label={`Range of ${p.id}`} opts={classOpts} onChange={(v) => patchItem("oprops", p.id, { range: v }, `Set the range of ${p.id} to ${v}.`)} /></td>
+                  <td><input type="checkbox" checked={p.maxOne} disabled={!!p.chain} onChange={() => patchItem("oprops", p.id, { maxOne: !p.maxOne }, `Set ${p.id} to ${p.maxOne ? "many" : "at most one"}.`)} aria-label={`${p.id} allows at most one value`} /></td>
+                  <td className="text-sm" style={{ color: "var(--muted)", minWidth: 160 }}>
+                    {p.chain && <div>Shortcut: {p.chain.join(" then ")}</div>}
+                    {p.inverseOf && <div>Inverse of {p.inverseOf}</div>}
+                    {p.renamedFrom && <div>Was {p.renamedFrom}</div>}
+                  </td>
+                  <td><Origin o={p.renamedFrom ? "proposed" : p.origin} /></td>
+                </tr>
+              ))}</tbody>
+            </table>
+            <button className="btn btn-small mt-3" onClick={() => addItem("oprops")}>Add a relationship</button>
+          </div>
+        )}
+        {tab === "dprops" && (
+          <div className="overflow-x-auto">
+            <table>
+              <thead><tr><th>Keep</th><th style={{ minWidth: 180 }}>Name</th><th style={{ minWidth: 140 }}>On</th><th style={{ minWidth: 120 }}>Type</th><th>Source</th></tr></thead>
+              <tbody>{onto.dprops.map((p) => (
+                <tr key={p.id} className={p.accepted ? "" : "row-off"}>
+                  <td><input type="checkbox" checked={p.accepted} onChange={() => toggle("dprops", p)} aria-label={`Keep ${p.id}`} /></td>
+                  <td><NameField value={p.id} hint={`Name of ${p.id}`} pattern={/^[a-z][A-Za-z0-9]*$/} onCommit={(v, pt) => renameItem("dprops", p.id, v, pt)} /></td>
+                  <td><Sel value={p.domain} label={`Class of ${p.id}`} opts={classOpts} onChange={(v) => patchItem("dprops", p.id, { domain: v }, `Moved ${p.id} to ${v}.`)} /></td>
+                  <td><Sel value={p.range} label={`Type of ${p.id}`} opts={["xsd:string", "xsd:integer", "xsd:decimal", "xsd:boolean", "xsd:date", "xsd:dateTime", "xsd:time"]} onChange={(v) => patchItem("dprops", p.id, { range: v }, `Changed the type of ${p.id} to ${v}.`)} /></td>
+                  <td className="mono" style={{ color: "var(--muted)" }}>{p.source ? localName(p.source.split(".").slice(0, -1).join(".")) + "." + p.source.split(".").pop() : <Origin o={p.origin} />}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+            <button className="btn btn-small mt-3" onClick={() => addItem("dprops")}>Add an attribute</button>
+          </div>
+        )}
+        {tab === "checks" && (
+          <div>
+            <p className="text-sm mb-3" style={{ color: "var(--muted)" }}>Modelling checks based on Noy and McGuinness, plus SAP-specific ones such as synonym detection across sources. Errors block a clean export; warnings are judgment calls.</p>
+            {!checks.length && <div className="panel p-4">No issues found.</div>}
+            <div className="panel">
+              {checks.map((c, i) => (
+                <div key={i} className="flex gap-3 p-3 items-start" style={{ borderTop: i ? "1px solid #E4E9ED" : 0 }}>
+                  <span className={`tag sev-${c.sev}`}>{c.sev === "error" ? "fix" : c.sev === "warn" ? "consider" : "note"}</span>
+                  <p className="text-sm"><span className="term mr-1">{c.term}</span>{c.msg}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <Next to={5} label="Continue to test" />
+      </div>
+    );
+  };
+
+  const renderTest = () => {
+    const asked = cqs.filter((q) => q.text.trim());
+    const passed = asked.filter((q) => q.verdict === "pass").length, failed = asked.filter((q) => q.verdict === "fail").length;
+    const short = (n) => (!n ? "" : n.k === "i" ? shorten(n.v, base) : n.v);
+    return (
+      <div>
+        <h2>Test the questions</h2>
+        <p className="lede mb-5">Each question runs against synthetic data generated from the accepted ontology. Compare the rows with what you expected, then mark it. A query that returns rows isn't automatically right.</p>
+        <div className="panel p-4 mb-4 flex flex-wrap gap-3 items-center">
+          <label className="text-sm flex items-center gap-2">Instances per class
+            <select value={perClass} onChange={(e) => setPerClass(parseInt(e.target.value, 10))} style={{ width: 72 }}>{[3, 4, 6, 8].map((n) => <option key={n} value={n}>{n}</option>)}</select>
+          </label>
+          <button className="btn" onClick={generateData}>{triples ? "Regenerate sample data" : "Generate sample data"}</button>
+          <button className="btn btn-primary" onClick={runAll} disabled={!asked.some((q) => q.sparql)}>Run all questions</button>
+          <span className="text-sm" style={{ color: "var(--muted)" }}>{triples ? `${triples.length} triples. ` : ""}{passed} passed, {failed} failed, {asked.length - passed - failed} not judged.</span>
+        </div>
+        <div className="flex flex-col gap-4">
+          {asked.map((q, i) => (
+            <div key={q.id} className="panel p-4">
+              <div className="flex flex-wrap gap-2 items-start mb-2">
+                <p className="font-medium flex-1 min-w-0">{i + 1}. {q.text}</p>
+                {q.verdict && <span className={`tag ${q.verdict === "pass" ? "o-you" : "sev-error"}`}>{q.verdict === "pass" ? "passed" : "failed"}</span>}
+              </div>
+              {q.expected && <p className="text-sm mb-2" style={{ color: "var(--muted)" }}>Expected: {q.expected}</p>}
+              {!q.sparql && q.answerable === false && <p className="text-sm mb-2" style={{ color: "var(--warn)" }}>Logged as a gap: {q.missing}. You can still write a query below if you disagree.</p>}
+              <textarea className="mono" rows={Math.min(10, Math.max(4, (q.sparql || "").split("\n").length + 1))} value={q.sparql} placeholder={`PREFIX onto: <${base}>\nSELECT ?x WHERE { ?x a onto:SalesOrder . }`} aria-label={`SPARQL for question ${i + 1}`}
+                onChange={(e) => { const v = e.target.value; setCqs((qs) => qs.map((x) => (x.id === q.id ? { ...x, sparql: v, answerable: v.trim() ? true : x.answerable } : x))); }} />
+              <div className="flex flex-wrap gap-2 mt-2">
+                <button className="btn btn-small" disabled={!q.sparql.trim()} onClick={() => { let t = triples; if (!t) { t = synthesize(onto, base, DATA_BASE, perClass); setTriples(t); } setCqs((qs) => qs.map((x) => (x.id === q.id ? runOne(x, t) : x))); }}>Run</button>
+                <button className="btn btn-small" disabled={!q.result} onClick={() => setVerdict(q.id, "pass")}>Mark as passed</button>
+                <button className="btn btn-small" disabled={!q.result} onClick={() => setVerdict(q.id, "fail")}>Mark as failed</button>
+              </div>
+              {q.result && (
+                <div className="mt-3 fresh">
+                  {q.result.error ? (
+                    <p className="text-sm" style={{ color: "var(--bad)" }}>{q.result.error}</p>
+                  ) : (
+                    <div>
+                      {q.result.unknown.length > 0 && <p className="text-sm mb-2" style={{ color: "var(--bad)" }}>Uses terms that aren't in the accepted ontology: {q.result.unknown.join(", ")}.</p>}
+                      <p className="text-sm mb-2" style={{ color: "var(--muted)" }}>{q.result.rows.length} {q.result.rows.length === 1 ? "row" : "rows"}{q.result.rows.length > 12 ? ", showing 12" : ""}.</p>
+                      {q.result.rows.length > 0 && (
+                        <div className="overflow-x-auto">
+                          <table>
+                            <thead><tr>{q.result.vars.map((v) => <th key={v} className="mono">?{v}</th>)}</tr></thead>
+                            <tbody>{q.result.rows.slice(0, 12).map((r, ri) => <tr key={ri}>{r.map((c, ci) => <td key={ci} className="mono">{short(c)}</td>)}</tr>)}</tbody>
+                          </table>
+                        </div>
+                      )}
+                      {q.result.rows.length === 0 && <p className="text-sm" style={{ color: "var(--warn)" }}>No rows. Either the sample data has no match for the filters, or the query path doesn't connect. Regenerate the data with more instances to tell the two apart.</p>}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        <p className="text-sm mt-4" style={{ color: "var(--muted)" }}>This engine is a design-time check. It supports triple patterns and FILTER, and it simulates inference by typing instances with their parent classes and filling in inverses and shortcuts. Re-run the exported queries in HANA Cloud KGE before relying on them.</p>
+        <Next to={6} label="Continue to export" />
+      </div>
+    );
+  };
+
+  const renderExport = () => {
+    const errs = checks.filter((c) => c.sev === "error");
+    const failed = cqs.filter((q) => q.verdict === "fail");
+    return (
+      <div>
+        <h2>Export</h2>
+        <p className="lede mb-5">Standard Turtle and SPARQL, so the output loads into HANA Cloud KGE or opens in any ontology tool. Check SAP's current documentation for the load route your HANA Cloud version supports.</p>
+        <div className="panel p-4 mb-4 flex flex-col gap-3">
+          <label className="text-sm">Ontology name<input type="text" className="mt-1" value={title} onChange={(e) => setTitle(e.target.value)} /></label>
+          <label className="text-sm">Namespace for classes and properties<input type="text" className="mt-1 mono" value={base} onChange={(e) => setBase(e.target.value)} /></label>
+        </div>
+        {(errs.length > 0 || failed.length > 0) && (
+          <div className="banner mb-4" style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>
+            {errs.length > 0 && <div>{errs.length} modelling {errs.length === 1 ? "error is" : "errors are"} still open in Review.</div>}
+            {failed.length > 0 && <div>{failed.length} {failed.length === 1 ? "question" : "questions"} failed testing. The files record this.</div>}
+          </div>
+        )}
+        <div className="panel">
+          {files.map((f, i) => (
+            <div key={f.name} className="p-4" style={{ borderTop: i ? "1px solid #E4E9ED" : 0 }}>
+              <div className="flex flex-wrap gap-2 items-center">
+                <div className="flex-1 min-w-0"><p className="mono font-medium">{f.name}</p><p className="text-sm" style={{ color: "var(--muted)" }}>{f.desc}</p></div>
+                <button className="btn btn-small" onClick={() => setOpenFile(openFile === f.name ? null : f.name)}>{openFile === f.name ? "Hide" : "Preview"}</button>
+                <button className="btn btn-small" onClick={() => copy(f)}>{copied === f.name ? "Copied" : "Copy"}</button>
+                <button className="btn btn-small btn-primary" onClick={() => { download(f.name, f.text); addLog("Export", `Downloaded ${f.name}.`); }}>Download</button>
+              </div>
+              {openFile === f.name && <pre className="preview mono mt-3">{f.text}</pre>}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const views = [renderLoad, renderScope, renderQuestions, renderPropose, renderReview, renderTest, renderExport];
+
+  return (
+    <div className="wb">
+      <style>{CSS}</style>
+      <header className="px-5 py-4 flex flex-wrap items-baseline gap-x-4 gap-y-1" style={{ borderBottom: "1px solid var(--rule)" }}>
+        <h1>Ontology workbench</h1>
+        <p className="text-sm" style={{ color: "var(--muted)" }}>Design time: SAP metadata in, a reviewed ontology and tested query pack out.</p>
+        <KeyBar />
+      </header>
+      <div className="flex flex-col md:flex-row">
+        <nav aria-label="Steps" className="md:w-60 flex-none p-3 md:min-h-screen" style={{ borderRight: "1px solid var(--rule)" }}>
+          <ol className="flex md:flex-col gap-1 overflow-x-auto">
+            {STEPS.map((s, i) => (
+              <li key={s.key} className="flex-none md:flex-auto">
+                <button className={`rail-step ${step === i ? "current" : ""} ${done[i] ? "done" : ""}`} disabled={!unlocked[i]} aria-current={step === i ? "step" : undefined} onClick={() => setStep(i)}>
+                  <span className="rail-num">{i + 1}</span>
+                  <span><span className="block text-sm font-medium">{s.title}</span><span className="hidden md:block text-xs" style={{ color: "var(--muted)" }}>{s.sub}</span></span>
+                </button>
+              </li>
+            ))}
+          </ol>
+          {log.length > 0 && (
+            <div className="hidden md:block mt-6 px-2">
+              <p className="text-xs font-medium mb-2" style={{ color: "var(--muted)" }}>Latest decisions</p>
+              {log.slice(-4).reverse().map((e, i) => <p key={i} className="text-xs mb-2" style={{ color: "var(--muted)" }}>{e.action}</p>)}
+            </div>
+          )}
+        </nav>
+        <main className="flex-1 min-w-0 p-5 md:p-8" style={{ maxWidth: 1100 }}>{views[step]()}</main>
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
